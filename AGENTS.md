@@ -5,17 +5,19 @@ Abre PDFs, extrae texto con coordenadas, revisa ortografía ES/EN en segundo pla
 subraya errores sobre la página y permite omitir + inyectar notas nativas.
 
 Stack: **Rust 2021**, Slint (UI declarativa), `pdfium-render` 0.8 (PDFium),
-`zspell` 0.5 + `unstable-suggestions` (Hunspell puro Rust, sin C).
+LanguageTool 6.x como sidecar Java local (ES+EN reales: ortografía por
+categoría TYPOS + sintaxis) + `ureq` 3 sync.
+`zspell` y `nlprule` se probaron y descartaron (ES débil en ambos).
 
 ## Estructura
 
 ```
-Cargo.toml      # zspell lleva features=["unstable-suggestions"] (solo por suggest())
-build.rs        # compila ui/app.slint + copia libpdfium y dicts junto al exe
-src/main.rs     # TODO el código Rust (~780 líneas, un solo binario a propósito)
-ui/app.slint    # TODO el UI (~290 líneas, controles propios, sin std-widgets)
+Cargo.toml      # ureq (HTTP sync al sidecar) + serde_json (/v2/check)
+build.rs        # compila ui/app.slint + copia libpdfium junto al exe + descarga LT a assets/lt/
+src/main.rs     # TODO el código Rust (un solo binario a propósito)
+ui/app.slint    # TODO el UI (controles propios, sin std-widgets)
 assets/pdfium/  # libpdfium.so + pdfium.dll + LICENSE.pdfium + licenses/ + VERSION.pdfium
-assets/dicts/   # en_US.{aff,dic} + es_ES.{aff,dic} (fuente: wooorm/dictionaries)
+assets/lt/      # LanguageTool desempaquetado (gitignoreado, lo baja build.rs)
 input/          # PDFs reales de prueba (El-viejo-y-el-mar.pdf)
 index.html      # prototipo web anterior, solo referencia de diseño/UX
 ```
@@ -31,9 +33,9 @@ PDFIUM_DYNAMIC_LIB_PATH=...      # alternativa a tener la lib junto al exe
 ```
 
 `build.rs` copia `assets/pdfium/{libpdfium.so,pdfium.dll}` (según SO) y
-`assets/dicts/*` a `target/{debug,release}/` (exe) y `target/.../dicts/`.
-En runtime se busca en: `$PDFIUM_DYNAMIC_LIB_PATH` → junto al exe →
-`CARGO_MANIFEST_DIR/assets/...`. Los `.tgz` originales de Pdfium **no** se commitean.
+descarga+descomprime LT a `assets/lt/` (gitignoreado, ~240MB zip).
+En runtime LT se busca en: `$LT_HOME` → junto al exe → `assets/lt/`.
+Java 17+ requerido (sidecar). Los `.tgz`/`.zip` originales **no** se commitean.
 
 ## Arquitectura lógica (`src/main.rs`)
 
@@ -44,30 +46,30 @@ Estado central: `struct State` en `Rc<RefCell<State>>` (hilo UI).
 - `words: Vec<Word>` — palabras de la página visible (`text + x0,y0,x1,y1` en
   puntos PDF, origen abajo-izq).
 - `all_errs: Vec<Misspelling>` — hallazgos de TODO el doc
-  (`word, sug, page, box, dismissed, kind`).
-- `view: Vec<usize>` — índices a `all_errs` tras el filtro de tipo. Los handlers
+  (`word, sug, page, box, dismissed, kind, sev`).
+- `view: Vec<usize>` — índices a `all_errs` tras los filtros. Los handlers
   de UI reciben índice de **fila** → mapear por `view` antes de tocar `all_errs`.
-- `scan_queue/scan_pos`, `scan_id`, `flash`, `dicts_ready`, `last_lang`, `tx`.
+- `scan_queue/scan_pos`, `scan_id`, `flash`, `lt_ready/lt_dead`, `last_lang`, `tx`.
 
 Flujos:
 
-1. `show()` — renderiza la página (`PdfRenderConfig` 1400px) a `slint::Image`,
-   extrae palabras y **quema subrayados rojos** + **wash amarillo** (flash) en el
-   bitmap. No toca el escaneo (seguro llamarlo para refrescar).
+1. `show()` — renderiza la página (`PdfRenderConfig` 1400px·zoom) a `slint::Image`,
+   extrae palabras y **quema subrayados por clase** (rojo ortografía, morado
+   sintaxis) + **wash amarillo** (flash) en el bitmap. No toca el escaneo.
 2. `start_scan()` — encola todas las páginas (desde la visible). **No usa hilos.**
-3. `scan_tick()` (Timer 250ms, presupuesto 80ms/tick) — extrae + `check_words`
-   por página, actualiza `all_errs`, barra (`scan-progress`, `scan-text` con %).
-   Espera a `dicts_ready`. Devuelve si tocó la página visible → `show()` re-subraya.
-4. Hilos fondo (solo 2, sin Pdfium): precarga de dicts al arrancar (manda
-   `DictsReady`) y `suggest_for()` bajo demanda al clic (escanea el wordlist
-   entero — lento por diseño de zspell, nunca en hilo UI).
-5. `SpellEvent = DictsReady | Sug(gen, idx, sug)`. `gen == scan_id` invalida
+3. `scan_tick()` (Timer 250ms, presupuesto 80ms/tick) — extrae palabras por
+   página y lanza un hilo HTTP al sidecar LT; la barra (`scan-progress`,
+   `scan-text` con %) mide páginas extraídas. Sin LT no avanza (salvo `lt_dead`,
+   que vacía la cola). Los `Syn(gen)` re-subrayan si tocan la página visible.
+4. Sidecar LT (hijo java o externo en :8081, `LtReady/LtFail` con `scan_id`):
+   `syntax_page()` mapea offsets en chars → box unión (`join_words`/`span_to_box`),
+   clase por categoría (`TYPOS`=Ortografía) y `sev` (GRAMMAR=grave…).
+5. `SpellEvent = LtReady | LtFail | Syn(gen, hits)`. `gen == scan_id` invalida
    respuestas viejas. Cambio de idioma se detecta en el Timer (`lang-idx !=
-   last_lang` → `start_scan`).
-6. `annotate()` — sticky-note nativa (`create_text_annotation` + `set_bounds`)
-   en el box del error, guarda en `{nombre}_anotado.pdf`. **Jamás sobreescribe.**
-7. Tipos: `kind_of()` → `Error` (rojo) | `Mayúscula` (azul, posible nombre propio)
-   | `Sigla` (naranja, posible acrónimo). Colores de `index.html`.
+   last_lang` → `start_scan`). **Nunca Pdfium en hilos** (se cuelga en `bind`).
+6. `annotate()` — sticky-note nativa (`create_text_annotation` + `set_bounds`),
+   acumulativa sobre `{nombre}_anotado.pdf` (vía temporal+rename). **Jamás toca el original.**
+7. Tipos y severidad: `kind` Ortografía|Sintaxis, `sev` mínima|intermedia|grave.
 
 ## UI (`ui/app.slint`)
 
@@ -82,25 +84,38 @@ Flujos:
 - `TextInput` con `accepted =>` guarda con Enter si hay texto. No existe
   `multi-line` en esta versión de Slint (solo una línea).
 - `Flickable + VerticalLayout + for` para la lista (no `ListView` de std-widgets).
-- Cards: franja de color por tipo + palabra + tipo/pág + descripción ES/EN +
-  sugerencias (`No hay sugerencias`/`No suggestions` si vacío) + Omitir/Restaurar
-  + Añadir comentario (editor inline) + filtro `Todos|Error|Mayús.|Sigla`.
-
-## Techos conocidos (no son bugs)
-
-- Parseo `.dic/.aff` tarda ~30s **en debug** (~10x menos en release); se precarga
-  al arrancar mientras el usuario elige archivo.
-- `suggest()` es O(wordlist) — solo bajo demanda, con `unstable-suggestions`.
-- **No crear segundo `Pdfium` en otro hilo**: se cuelga en `bind`. Por eso el
-  escaneo es troceado en el hilo UI.
-- `OnceLock<Result<_, String>>` en vez de `get_or_try_init` (inestable en este toolchain).
+- Cards: franja de color por gravedad + palabra + tipo/gravedad/pág +
+  descripción ES/EN + sugerencias LT (`No hay sugerencias` si vacío) +
+  Omitir/Restaurar (cascada por solape) + comentario + obs. gramatical
+  (editor inline) + 2 desplegables `DropSel` Tipo/Gravedad + grupo ×5+.
 - Extracción = unión simple de boxes por carácter, sin shaping tipográfico.
 - No hay reemplazo de texto en el PDF (cirugía redact+reescribir, fuera del mínimo);
   las sugerencias son de referencia, como en `index.html`.
+
+## Techos conocidos (no son bugs)
+
+- **No crear segundo `Pdfium` en otro hilo**: se cuelga en `bind`. Por eso el
+  escaneo es troceado en el hilo UI y los hilos de página son solo HTTP.
+- Guardar sobre el `_anotado.pdf` abierto lo mapea Pdfium (SIGTRAP): se guarda
+  vía temporal+rename (`save_doc`).
+- En Slint `visible: false` sigue reservando layout: para mostrar/ocultar se
+  usan bloques `if` (placeholder `Sin documento`, toolbar, desplegables).
 
 ## Estado
 
 Fase 1 (ventana+render) · Fase 2 (texto+coords) · Fase 3 (corrector fondo) ·
 Fase 4 (subrayado, omitir, notas nativas) · Extras (tema claro/oscuro, progreso
 con % izq→der verde, tipos con color, filtro, flash amarillo 5s, descripciones ES/EN).
+Fase 5 (revisión 100% LT: `kind`=Ortografía|Sintaxis + `sev` mínima|intermedia|grave
+(categoría LT; TYPOS=ortografía), 2 desplegables propios `DropSel`
+Tipo+Gravedad —inline, sin std-widgets—, omitir en cascada por solape de boxes
++ limpieza de flash, barra única vía `refresh_progress`, subrayado por clase (rojo
+ortografía, morado sintaxis), zoom ×1.25 (0.5–3.0) + nota libre por clic en el visor
+(`Flickable` 1:1, `page-clicked` → `annotate_at`), notas acumulativas sobre
+`_anotado.pdf` (guardado vía temporal+rename — Pdfium mapea el archivo), sidecar java hijo —reutiliza externo
+en :8081—, `LtReady/LtFail/Syn(gen)` con `scan_id`, hilos de página solo HTTP
+con palabras clonadas —nunca Pdfium en hilos—, offsets en chars → box unión
+vía `join_words`/`span_to_box`; `build.rs` descarga LT ~240MB a `assets/lt/`
+gitignoreado —requiere red en build y Java 17+ en runtime—; medido: arranque
+~4s, ~80ms/check, ~650MB RAM). `cargo test` rápido (sin motores pesados en tests).
 Licencia proyecto: MIT. Pdfium: BSD + third-party en `assets/pdfium/licenses/`.
