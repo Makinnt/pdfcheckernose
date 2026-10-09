@@ -1,2 +1,7 @@
 /target
 *.tgz
+# ponytail: LT pesa ~400MB; lo baja build.rs la primera vez, no se commitea
+/assets/lt/
+/assets/lt.zip
+# PDFs con notas inyectadas (generados al anotar)
+*_anotado.pdf

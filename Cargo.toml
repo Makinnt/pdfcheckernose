@@ -14,10 +14,13 @@ pdfium-render = "0.8"
 image = "0.25"
 rfd = "0.15"
 anyhow = "1.0"
-zspell = { version = "0.5", features = ["unstable-suggestions"] } # ponytail: flag unstable solo por suggest(); si molesta, Fase 3 queda en check()
+ureq = "3" # ponytail: cliente HTTP sync sin runtime tokio; solo habla con el sidecar LT local
+serde_json = "1" # ponytail: parsea /v2/check sin tipos extra
 
 [build-dependencies]
 slint-build = "1.10"
+ureq = "3"
+zip = "0.6"
 
 [profile.release]
 opt-level = "z"
