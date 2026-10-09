@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=LexPDF
+Comment=Revisor offline de ortografía y sintaxis en PDF (ES/EN)
+Exec=lexpdf
+Icon=lexpdf
+Type=Application
+Categories=Office;Viewer;
+StartupWMClass=lexpdf

@@ -7,22 +7,32 @@ Set-Location $Root
 
 cargo build --release
 New-Item -ItemType Directory -Force dist/windows | Out-Null
-Copy-Item target/release/pdf-corrector.exe dist/windows/
+Copy-Item target/release/lexpdf.exe dist/windows/
 Copy-Item assets/pdfium/pdfium.dll dist/windows/
 if (Test-Path assets/lt/languagetool-server.jar) {
   Copy-Item assets/lt dist/windows/lt -Recurse -Force
 } else {
   Write-Warning 'Sin assets/lt (¿falló la descarga en build?). El instalador pedirá Java igualmente.'
 }
-# JRE empaquetado (opcional pero recomendado): Temurin 21 x64
+# JRE minimizado con jlink (~40-60MB). Usa el JDK del sistema o $JAVA_HOME;
+# si no hay JDK, cae al JRE completo de Temurin 21.
+$Modules = 'java.base,java.logging,java.xml,java.naming,java.management,java.sql,java.desktop,java.net.http,jdk.httpserver,jdk.unsupported'
 if (-not (Test-Path dist/windows/jre/bin/java.exe)) {
-  Write-Host 'Descargando Temurin JRE 21 x64...'
-  $api = 'https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse'
-  Invoke-WebRequest $api -OutFile dist/temurin-jre.zip
-  Expand-Archive dist/temurin-jre.zip -DestinationPath dist/tmp-jre -Force
-  $inner = Get-ChildItem dist/tmp-jre | Select-Object -First 1
-  Move-Item $inner.FullName dist/windows/jre -Force
-  Remove-Item dist/tmp-jre -Recurse -Force
-  Remove-Item dist/temurin-jre.zip -Force
+  $jlink = Get-Command jlink -ErrorAction SilentlyContinue
+  if (-not $jlink -and $env:JAVA_HOME) { $jlink = Join-Path $env:JAVA_HOME 'bin/jlink.exe' }
+  if ($jlink -and (Test-Path $jlink)) {
+    Write-Host 'Generando JRE con jlink...'
+    & $jlink --compress=2 --strip-debug --no-header-files --no-man-pages `
+      --add-modules $Modules --output dist/windows/jre
+  } else {
+    Write-Host 'Descargando Temurin JRE 21 x64...'
+    $api = 'https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse'
+    Invoke-WebRequest $api -OutFile dist/temurin-jre.zip
+    Expand-Archive dist/temurin-jre.zip -DestinationPath dist/tmp-jre -Force
+    $inner = Get-ChildItem dist/tmp-jre | Select-Object -First 1
+    Move-Item $inner.FullName dist/windows/jre -Force
+    Remove-Item dist/tmp-jre -Recurse -Force
+    Remove-Item dist/temurin-jre.zip -Force
+  }
 }
-Write-Host 'OK: dist/windows listo para iscc installer/windows/pdf-corrector.iss'
+Write-Host 'OK: dist/windows listo para iscc installer/windows/lexpdf.iss'

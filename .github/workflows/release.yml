@@ -1,0 +1,148 @@
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  JLINK_MODULES: java.base,java.logging,java.xml,java.naming,java.management,java.sql,java.desktop,java.net.http,jdk.httpserver,jdk.unsupported
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache LT
+        uses: actions/cache@v4
+        with:
+          path: |
+            assets/lt.zip
+            assets/lt/
+          key: languagetool-assets-Linux
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: JDK Temurin 17
+        run: |
+          curl -sL -o /tmp/jdk.tar.gz https://api.adoptium.net/v3/binary/latest/17/ga/linux/x64/jdk/hotspot/normal/eclipse
+          mkdir -p /tmp/jdk && tar xzf /tmp/jdk.tar.gz -C /tmp/jdk --strip-components=1
+
+      - name: Stage AppDir
+        run: |
+          export JAVA_HOME=/tmp/jdk
+          ./installer/linux/stage-appimage.sh
+
+      - name: Smoke test (JRE + LT real)
+        run: |
+          ./dist/AppDir/usr/share/lexpdf/jre/bin/java -version
+          ./dist/AppDir/usr/share/lexpdf/jre/bin/java -Xms256m -Xmx1g -Dfile.encoding=UTF-8 \
+            -cp ./dist/AppDir/usr/share/lexpdf/lt/languagetool-server.jar \
+            org.languagetool.server.HTTPServer --port 8081 &
+          SRV=$!
+          for i in $(seq 1 45); do
+            sleep 2
+            curl -sf http://localhost:8081/v2/languages >/dev/null 2>&1 && break
+          done
+          curl -sf -X POST --data "language=es-ES" \
+            --data-urlencode "text=Pienso de que la problema es grave." \
+            http://localhost:8081/v2/check | grep -q DEQUEISMO
+          kill $SRV
+
+      - name: AppImage
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libfuse2
+          curl -sL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ./appimagetool ./dist/AppDir ./dist/LexPDF-x86_64.AppImage
+
+      - name: Sube AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: LexPDF-linux
+          path: dist/LexPDF-x86_64.AppImage
+
+      - name: Release upload
+        if: github.event_name == 'release'
+        run: gh release upload ${{ github.ref_name }} dist/LexPDF-x86_64.AppImage --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache LT
+        uses: actions/cache@v4
+        with:
+          path: |
+            assets/lt.zip
+            assets/lt/
+          key: languagetool-assets-Windows
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: JDK Temurin 17 + jlink
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse -OutFile $env:TEMP/jdk.zip
+          Expand-Archive $env:TEMP/jdk.zip -DestinationPath $env:TEMP/jdkdir -Force
+          $jdk = (Get-ChildItem $env:TEMP/jdkdir)[0].FullName
+          & "$jdk/bin/jlink" --compress=2 --strip-debug --no-header-files --no-man-pages `
+            --add-modules $env:JLINK_MODULES --output dist/windows/jre
+
+      - name: Stage + Inno
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/windows | Out-Null
+          Copy-Item target/release/lexpdf.exe dist/windows/
+          Copy-Item assets/pdfium/pdfium.dll dist/windows/
+          Copy-Item assets/lt dist/windows/lt -Recurse -Force
+      - name: Compila instalador
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.2
+        with:
+          path: installer/windows/lexpdf.iss
+
+      - name: Smoke test (JRE + LT real)
+        shell: pwsh
+        run: |
+          Start-Process dist/windows/jre/bin/java.exe -ArgumentList '-Xms256m','-Xmx1g','-Dfile.encoding=UTF-8','-cp','dist/windows/lt/languagetool-server.jar','org.languagetool.server.HTTPServer','--port','8081' -WindowStyle Hidden
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep 2
+            try { Invoke-WebRequest http://localhost:8081/v2/languages -UseBasicParsing | Out-Null; break } catch {}
+          }
+          $r = Invoke-WebRequest -Method Post -Body @{language='es-ES'; text='Pienso de que la problema es grave.'} -Uri http://localhost:8081/v2/check -UseBasicParsing
+          if ($r.Content -notmatch 'DEQUEISMO') { throw 'LT no responde como se espera' }
+
+      # Firma con SignPath (gratis para OSS). Activar con cuenta + repo público:
+      # Secrets SIGNPATH_API_TOKEN / SIGNPATH_ORG_ID, descomentar y ajustar slugs.
+      # - name: Firma con SignPath
+      #   uses: signpath/github-action@v1
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+      #     project-slug: 'lexpdf'
+      #     signing-policy-slug: 'release-signing'
+      #     github-artifact-id: 'installer'
+      #     output-artifact-directory: 'dist/signed'
+
+      - name: Sube instalador
+        uses: actions/upload-artifact@v4
+        with:
+          name: LexPDF-windows
+          path: dist/lexpdf-setup.exe
+
+      - name: Release upload
+        if: github.event_name == 'release'
+        run: gh release upload ${{ github.ref_name }} dist/lexpdf-setup.exe --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

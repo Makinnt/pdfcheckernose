@@ -124,3 +124,6 @@ ortografía, morado sintaxis), zoom ×1.25 (0.5–3.0) + nota libre con botón `
 Licencia proyecto: MIT. Pdfium: BSD + third-party en `assets/pdfium/licenses/`.
 Windows: `installer/windows/` (Inno + `stage.ps1` + CI con SignPath opt-in);
 java en `$JAVA_BIN` → `jre\` junto al exe → `PATH`.
+Linux/AppImage: `installer/linux/` (`stage-appimage.sh` → AppDir + AppRun con
+`LT_HOME`/`JAVA_BIN`/`PDFIUM_DYNAMIC_LIB_PATH`); releases vía `release.yml`
+(con smoke test LT real y jlink incl. `jdk.httpserver`).
