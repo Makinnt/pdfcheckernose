@@ -76,6 +76,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          name: Release ${{ github.ref_name }}
           files: dist/LexPDF-x86_64.AppImage
 
   build-windows:
@@ -155,4 +156,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          name: Release ${{ github.ref_name }}
           files: dist/lexpdf-setup.exe
