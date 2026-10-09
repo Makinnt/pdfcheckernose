@@ -696,7 +696,6 @@ fn show(ui: &AppWindow, st: &mut State, page: u32) {
             ui.set_status(format!("{} — {} págs. · {} palabras en pág. {}", path.display(), total, words.len(), page + 1).into());
             ui.set_img_w(iw as i32);
             ui.set_img_h(ih as i32);
-            ui.set_zoom_label(format!("{}%", (st.zoom * 100.0).round() as u32).into());
             st.words = words;
         }
         Err(e) => {
@@ -856,6 +855,8 @@ fn main() -> anyhow::Result<()> {
             let cur = st.borrow().page;
             if cur > 0 {
                 show(&ui, &mut st.borrow_mut(), cur - 1);
+                ui.set_view_x(0.0);
+                ui.set_view_y(0.0);
             }
         });
     }
@@ -867,6 +868,8 @@ fn main() -> anyhow::Result<()> {
             let (cur, total) = (st.borrow().page, st.borrow().total);
             if cur + 1 < total {
                 show(&ui, &mut st.borrow_mut(), cur + 1);
+                ui.set_view_x(0.0);
+                ui.set_view_y(0.0);
             }
         });
     }
@@ -879,6 +882,9 @@ fn main() -> anyhow::Result<()> {
             st.borrow_mut().zoom = z;
             let pg = st.borrow().page;
             show(&ui, &mut st.borrow_mut(), pg);
+            ui.set_view_x(0.0);
+            ui.set_view_y(0.0);
+            ui.set_zoom_label(format!("{}%", (z * 100.0).round() as u32).into());
         });
     }
     {
@@ -890,18 +896,27 @@ fn main() -> anyhow::Result<()> {
             st.borrow_mut().zoom = z;
             let pg = st.borrow().page;
             show(&ui, &mut st.borrow_mut(), pg);
+            ui.set_view_x(0.0);
+            ui.set_view_y(0.0);
+            ui.set_zoom_label(format!("{}%", (z * 100.0).round() as u32).into());
         });
     }
     {
         let ui_weak = ui.as_weak();
         let st = st.clone();
-        ui.on_zoom_set(move |z| {
+        ui.on_zoom_text(move |t| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            if z.is_finite() {
-                st.borrow_mut().zoom = z.clamp(0.5, 3.0);
+            // acepta "150", "150%" o "1.5x": número inicial = porcentaje
+            let num: String = t.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',').collect();
+            if let Ok(v) = num.replace(',', ".").parse::<f32>() {
+                if v.is_finite() {
+                    st.borrow_mut().zoom = (v / 100.0).clamp(0.5, 3.0);
+                }
             }
             let pg = st.borrow().page;
-            show(&ui, &mut st.borrow_mut(), pg); // reescribe la etiqueta con el valor real
+            show(&ui, &mut st.borrow_mut(), pg);
+            let z = st.borrow().zoom;
+            ui.set_zoom_label(format!("{}%", (z * 100.0).round() as u32).into());
         });
     }
     {
@@ -917,26 +932,6 @@ fn main() -> anyhow::Result<()> {
             ui.set_free_note_text("".into());
             ui.set_free_note_on(true);
             notify(&ui, &st, format!("Nota en pág {} (centro): escribe y pulsa Guardar", pg + 1));
-        });
-    }
-    {
-        let ui_weak = ui.as_weak();
-        let st = st.clone();
-        ui.on_page_clicked(move |mx, my| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let s = st.borrow();
-            if s.img_w == 0 || s.img_h == 0 {
-                return;
-            }
-            // px de imagen 1:1 → puntos PDF (origen abajo-izq)
-            let x = (mx / s.img_w as f32 * s.page_w).clamp(0.0, s.page_w);
-            let y = (s.page_h - my / s.img_h as f32 * s.page_h).clamp(0.0, s.page_h);
-            let pg = s.page;
-            drop(s);
-            st.borrow_mut().free_pt = Some((pg, x, y));
-            ui.set_free_note_text("".into());
-            ui.set_free_note_on(true);
-            notify(&ui, &st, format!("Nota en pág {}: escribe y pulsa Guardar", pg + 1));
         });
     }
     {
@@ -990,6 +985,27 @@ fn main() -> anyhow::Result<()> {
                 show(&ui, &mut st.borrow_mut(), pg); // salto + flash amarillo
             } else {
                 show(&ui, &mut st.borrow_mut(), cur);
+            }
+            // lleva el visor al error: content-x/y es offset del contenido
+            // (negativo). En vertical siempre; en horizontal solo si está
+            // fuera de vista, para conservar el margen izquierdo.
+            {
+                let s = st.borrow();
+                if let Some(e) = s.all_errs.get(gi) {
+                    if s.img_w > 0 && s.img_h > 0 {
+                        let (x, y, w, h) = pdf_to_image(e.x0, e.y0, e.x1, e.y1, s.page_w, s.page_h, s.img_w, s.img_h);
+                        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+                        let (vw, vh) = (ui.get_view_w(), ui.get_view_h());
+                        let oy = -((cy - vh / 2.0).clamp(0.0, (s.img_h as f32 - vh).max(0.0)));
+                        ui.set_view_y(oy);
+                        let ox_cur = ui.get_view_x();
+                        let vis0 = -ox_cur;
+                        if cx < vis0 || cx > vis0 + vw {
+                            let ox = -((cx - vw / 2.0).clamp(0.0, (s.img_w as f32 - vw).max(0.0)));
+                            ui.set_view_x(ox);
+                        }
+                    }
+                }
             }
             notify(&ui, &st, detail); // LT ya trae reemplazos; sin hilos aquí
         });

@@ -97,7 +97,11 @@ export component AppWindow inherits Window {
     in-out property <string> popup-text: "";
     in-out property <int> img-w: 0;
     in-out property <int> img-h: 0;
-    in-out property <string> zoom-label: "100%";
+    in-out property <string> zoom-label: "50%";
+    in-out property <length> view-x: 0px;
+    in-out property <length> view-y: 0px;
+    in-out property <length> view-w: 0px;
+    in-out property <length> view-h: 0px;
     in-out property <bool> free-note-on: false;
     in-out property <string> free-note-text: "";
 
@@ -115,8 +119,7 @@ export component AppWindow inherits Window {
     callback popup-dismiss();
     callback zoom-in();
     callback zoom-out();
-    callback zoom-set(float);
-    callback page-clicked(float, float);
+    callback zoom-text(string);
     callback free-note-new();
     callback free-note-save();
     callback free-note-cancel();
@@ -379,10 +382,10 @@ export component AppWindow inherits Window {
                                 width: 58px; height: 28px;
                                 background: root.c-pill; border-radius: 4px;
                                 TextInput {
-                                    text <=> root.zoom-label;
+                                    text: root.zoom-label;
                                     color: root.c-fg; font-size: 12px;
                                     horizontal-alignment: center; vertical-alignment: center;
-                                    accepted => { root.zoom-set(self.text.to-float() / 100); }
+                                    accepted => { root.zoom-text(self.text); }
                                 }
                             }
                             Rectangle {
@@ -400,6 +403,10 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     content-width: root.img-w * 1px;
                     content-height: root.img-h * 1px;
+                    content-x <=> root.view-x;
+                    content-y <=> root.view-y;
+                    changed width => { root.view-w = self.width; }
+                    changed height => { root.view-h = self.height; }
                     Rectangle {
                         width: root.img-w * 1px;
                         height: root.img-h * 1px;
@@ -407,17 +414,13 @@ export component AppWindow inherits Window {
                             source <=> root.page-image;
                             width: 100%; height: 100%;
                         }
-                        pg-touch := TouchArea {
-                            width: 100%; height: 100%;
-                            clicked => { root.page-clicked(pg-touch.mouse-x / 1px, pg-touch.mouse-y / 1px); }
-                        }
                     }
                 }
 
                 if (root.free-note-on): VerticalLayout {
                     spacing: 3px;
                     visible: root.has-doc;
-                    Text { text: "Nota libre: toca el punto (ya marcado), escribe y guarda."; font-size: 12px; color: root.c-dim; wrap: word-wrap; }
+                    Text { text: "Nota libre en la página visible: escribe y guarda."; font-size: 12px; color: root.c-dim; wrap: word-wrap; }
                     Rectangle {
                         height: 30px;
                         background: root.c-card; border-radius: 4px;
