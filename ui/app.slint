@@ -4,8 +4,11 @@ struct ErrRow {
     page: int,
     dimmed: bool,
     kind: string,
+    sev: string,
     bar: color,
     desc: string,
+    count: int,
+    is_group: bool,
 }
 
 component MiniBtn inherits Rectangle {
@@ -13,15 +16,60 @@ component MiniBtn inherits Rectangle {
     in property <color> bg: #eee;
     in property <color> fg: #222;
     callback clicked;
-    height: 24px;
+    height: 22px;
     horizontal-stretch: 1;
     background: bg;
     border-radius: 4px;
     Text {
-        text: label; color: fg; font-size: 12px;
+        text: label; color: fg; font-size: 11px;
         horizontal-alignment: center; vertical-alignment: center;
     }
     TouchArea { width: parent.width; height: parent.height; clicked => { root.clicked(); } }
+}
+
+// Desplegable propio (inline: al abrir empuja el contenido; evita std-widgets
+// que sale en blanco y el gotcha del TouchArea que se traga clics).
+component DropSel inherits Rectangle {
+    in property <string> label;
+    in property <[string]> opts;
+    in-out property <int> current: 0;
+    in property <color> bg: #eee;
+    in property <color> fg: #222;
+    in property <color> hl: #222;
+    in property <color> hl-fg: white;
+    callback picked(int);
+    in-out property <bool> open: false;
+    background: transparent;
+    VerticalLayout {
+        spacing: 2px;
+        Rectangle {
+            height: 26px;
+            background: bg; border-radius: 4px;
+            HorizontalLayout {
+                padding-left: 8px; padding-right: 8px; spacing: 6px;
+                Text {
+                    text: label + ": " + opts[current];
+                    color: fg; font-size: 12px;
+                    horizontal-stretch: 1; vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text { text: open ? "▲" : "▼"; color: fg; font-size: 11px; vertical-alignment: center; }
+            }
+            TouchArea { width: parent.width; height: parent.height; clicked => { open = !open; } }
+        }
+        if (open): VerticalLayout {
+            spacing: 2px;
+            for o[idx] in opts: Rectangle {
+                height: 24px;
+                background: idx == current ? hl : bg; border-radius: 4px;
+                Text {
+                    text: o; color: idx == current ? hl-fg : fg; font-size: 12px;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+                TouchArea { width: parent.width; height: parent.height; clicked => { current = idx; picked(idx); open = false; } }
+            }
+        }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -42,10 +90,16 @@ export component AppWindow inherits Window {
     in-out property <bool> scanning: false;
     in-out property <int> scan-progress: 0;
     in-out property <string> scan-text: "";
-    in-out property <bool> dicts-ready: false;
     in-out property <int> selected-note: -1;
     in-out property <string> note-text: "";
-    in-out property <int> err-filter: 0;
+    in-out property <int> type-filter: 0;
+    in-out property <int> sev-filter: 0;
+    in-out property <string> popup-text: "";
+    in-out property <int> img-w: 0;
+    in-out property <int> img-h: 0;
+    in-out property <string> zoom-label: "100%";
+    in-out property <bool> free-note-on: false;
+    in-out property <string> free-note-text: "";
 
     callback open-pdf();
     callback prev-page();
@@ -54,7 +108,18 @@ export component AppWindow inherits Window {
     callback omit-clicked(int);
     callback note-clicked(int);
     callback save-note(int);
-    callback filter-set(int);
+    callback grammar-clicked(int);
+    callback group-toggle(int);
+    callback type-set(int);
+    callback sev-set(int);
+    callback popup-dismiss();
+    callback zoom-in();
+    callback zoom-out();
+    callback zoom-set(float);
+    callback page-clicked(float, float);
+    callback free-note-new();
+    callback free-note-save();
+    callback free-note-cancel();
     callback lang-set(int);
     callback theme-toggle();
 
@@ -127,11 +192,6 @@ export component AppWindow inherits Window {
                         TouchArea { width: parent.width; height: parent.height; clicked => { root.lang-set(i); } }
                     }
                 }
-                Text {
-                    text: "Cargando diccionarios… (solo la primera vez)";
-                    font-size: 12px; color: root.c-dim;
-                    visible: !root.dicts-ready;
-                }
                 Text { text <=> root.status; font-size: 13px; color: root.c-dim; wrap: word-wrap; }
 
                 Rectangle { height: 1px; background: root.c-line; }
@@ -162,18 +222,30 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 6px;
                     visible: root.has-doc;
-                    for f[j] in ["Todos", "Error", "Mayús.", "Sigla"]: MiniBtn {
-                        label: f;
-                        bg: root.err-filter == j ? root.c-accent : root.c-pill;
-                        fg: root.err-filter == j ? root.c-accent-fg : root.c-fg;
-                        clicked => { root.filter-set(j); }
+                    DropSel {
+                        label: "Tipo";
+                        opts: ["Todas", "Ortografía", "Sintaxis"];
+                        current <=> root.type-filter;
+                        bg: root.c-pill; fg: root.c-fg;
+                        hl: root.c-accent; hl-fg: root.c-accent-fg;
+                        horizontal-stretch: 1;
+                        picked(i) => { root.type-set(i); }
+                    }
+                    DropSel {
+                        label: "Gravedad";
+                        opts: ["Todas", "Grave", "Intermedia", "Mínima"];
+                        current <=> root.sev-filter;
+                        bg: root.c-pill; fg: root.c-fg;
+                        hl: root.c-accent; hl-fg: root.c-accent-fg;
+                        horizontal-stretch: 1;
+                        picked(i) => { root.sev-set(i); }
                     }
                 }
                 Flickable {
                     height: 420px;
                     visible: root.has-doc;
                     VerticalLayout {
-                        spacing: 8px;
+                        spacing: 6px;
                         for e[i] in root.errors: Rectangle {
                             border-color: root.c-line;
                             border-width: 1px;
@@ -185,38 +257,52 @@ export component AppWindow inherits Window {
                                 // franja de color por tipo, como index.html
                                 Rectangle { width: 5px; background: e.bar; }
                                 VerticalLayout {
-                                    padding: 8px;
-                                    spacing: 4px;
+                                    padding: 6px;
+                                    spacing: 3px;
                                     horizontal-stretch: 1;
                                     Rectangle {
-                                        height: 22px;
+                                        height: 20px;
                                         HorizontalLayout {
                                             spacing: 6px;
                                             Text { text: e.word; font-size: 14px; font-weight: 700; color: root.c-fg; vertical-alignment: center; }
-                                            Text { text: e.kind + " · pág " + (e.page + 1); font-size: 12px; color: root.c-dim; vertical-alignment: center; }
+                                            Text { text: e.kind + " · " + e.sev + " · pág " + (e.page + 1); font-size: 12px; color: root.c-dim; vertical-alignment: center; }
                                         }
                                         TouchArea { width: parent.width; height: parent.height; clicked => { root.error-clicked(i); } }
                                     }
                                     Text { text: e.desc; font-size: 13px; font-italic: true; color: root.c-dim; wrap: word-wrap; }
-                                    Text { text: e.sug; font-size: 12px; color: root.c-dim; wrap: word-wrap; }
+                                    Text { text: e.sug; font-size: 12px; color: root.c-fg; wrap: word-wrap; }
                                     HorizontalLayout {
-                                        spacing: 6px;
+                                        spacing: 4px;
                                         MiniBtn {
                                             label: e.dimmed ? "Restaurar" : "Omitir";
                                             bg: root.c-pill; fg: root.c-fg;
                                             clicked => { root.omit-clicked(i); }
                                         }
                                         MiniBtn {
-                                            label: "Añadir comentario";
+                                            label: "Comentar";
                                             bg: root.c-pill; fg: root.c-fg;
                                             clicked => { root.note-clicked(i); }
                                         }
+                                        MiniBtn {
+                                            label: "Obs. gramatical";
+                                            bg: root.c-pill; fg: root.c-fg;
+                                            clicked => { root.grammar-clicked(i); }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        visible: e.count >= 5;
+                                        MiniBtn {
+                                            label: e.is-group ? "Desagrupar (×" + e.count + ")" : "Agrupar (×" + e.count + ")";
+                                            bg: root.c-pill; fg: root.c-fg;
+                                            clicked => { root.group-toggle(i); }
+                                        }
                                     }
                                     VerticalLayout {
-                                        spacing: 4px;
+                                        spacing: 3px;
                                         visible: root.selected-note == i;
                                         Rectangle {
-                                            height: 34px;
+                                            height: 30px;
                                             background: root.c-pill; border-radius: 4px;
                                             TextInput {
                                                 text <=> root.note-text;
@@ -226,13 +312,10 @@ export component AppWindow inherits Window {
                                                 }
                                             }
                                         }
-                                        HorizontalLayout {
-                                            spacing: 6px;
-                                            MiniBtn {
-                                                label: "Guardar en PDF";
-                                                bg: root.c-accent; fg: root.c-accent-fg;
-                                                clicked => { root.save-note(i); }
-                                            }
+                                        MiniBtn {
+                                            label: "Guardar en PDF";
+                                            bg: root.c-accent; fg: root.c-accent-fg;
+                                            clicked => { root.save-note(i); }
                                         }
                                     }
                                 }
@@ -243,6 +326,7 @@ export component AppWindow inherits Window {
                 Text {
                     text: "El visor PDF aparecerá a la derecha cuando abras un documento.";
                     font-size: 13px; color: root.c-dim; wrap: word-wrap;
+                    horizontal-alignment: center;
                     visible: !root.has-doc;
                 }
             }
@@ -255,10 +339,9 @@ export component AppWindow inherits Window {
                 padding: 8px;
                 spacing: 6px;
 
-                HorizontalLayout {
+                if (root.has-doc): HorizontalLayout {
                     spacing: 8px;
                     alignment: center;
-                    visible: root.has-doc;
                     Rectangle {
                         width: 34px; height: 28px;
                         background: root.c-pill; border-radius: 4px;
@@ -272,22 +355,120 @@ export component AppWindow inherits Window {
                         Text { text: "▶"; color: root.c-fg; horizontal-alignment: center; vertical-alignment: center; }
                         TouchArea { width: parent.width; height: parent.height; clicked => { next-page(); } }
                     }
+                    Rectangle {
+                        width: 52px; height: 28px;
+                        background: root.c-pill; border-radius: 4px;
+                        Text { text: "✎ Nota"; color: root.c-fg; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { width: parent.width; height: parent.height; clicked => { free-note-new(); } }
+                    }
+                    TouchArea {
+                        width: 122px; height: 28px;
+                        scroll-event(e) => {
+                            if (e.delta-y > 0px) { zoom-in(); } else if (e.delta-y < 0px) { zoom-out(); }
+                            accept
+                        }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            Rectangle {
+                                width: 28px; height: 28px;
+                                background: root.c-pill; border-radius: 4px;
+                                Text { text: "−"; color: root.c-fg; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
+                                TouchArea { width: parent.width; height: parent.height; clicked => { zoom-out(); } }
+                            }
+                            Rectangle {
+                                width: 58px; height: 28px;
+                                background: root.c-pill; border-radius: 4px;
+                                TextInput {
+                                    text <=> root.zoom-label;
+                                    color: root.c-fg; font-size: 12px;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                    accepted => { root.zoom-set(self.text.to-float() / 100); }
+                                }
+                            }
+                            Rectangle {
+                                width: 28px; height: 28px;
+                                background: root.c-pill; border-radius: 4px;
+                                Text { text: "+"; color: root.c-fg; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
+                                TouchArea { width: parent.width; height: parent.height; clicked => { zoom-in(); } }
+                            }
+                        }
+                    }
                 }
 
-                Image {
-                    source <=> root.page-image;
+                if (root.has-doc): Flickable {
+                    min-height: 200px;
+                    vertical-stretch: 1;
+                    content-width: root.img-w * 1px;
+                    content-height: root.img-h * 1px;
+                    Rectangle {
+                        width: root.img-w * 1px;
+                        height: root.img-h * 1px;
+                        Image {
+                            source <=> root.page-image;
+                            width: 100%; height: 100%;
+                        }
+                        pg-touch := TouchArea {
+                            width: 100%; height: 100%;
+                            clicked => { root.page-clicked(pg-touch.mouse-x / 1px, pg-touch.mouse-y / 1px); }
+                        }
+                    }
+                }
+
+                if (root.free-note-on): VerticalLayout {
+                    spacing: 3px;
                     visible: root.has-doc;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                    Text { text: "Nota libre: toca el punto (ya marcado), escribe y guarda."; font-size: 12px; color: root.c-dim; wrap: word-wrap; }
+                    Rectangle {
+                        height: 30px;
+                        background: root.c-card; border-radius: 4px;
+                        border-width: 1px; border-color: root.c-line;
+                        TextInput {
+                            text <=> root.free-note-text;
+                            font-size: 13px; color: root.c-fg;
+                            accepted => { if (root.free-note-text != "") { root.free-note-save(); } }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 4px;
+                        MiniBtn {
+                            label: "Guardar nota";
+                            bg: root.c-accent; fg: root.c-accent-fg;
+                            clicked => { root.free-note-save(); }
+                        }
+                        MiniBtn {
+                            label: "Cancelar";
+                            bg: root.c-pill; fg: root.c-fg;
+                            clicked => { root.free-note-cancel(); }
+                        }
+                    }
                 }
 
-                Text {
+                if (!root.has-doc): Text {
                     text: "Sin documento";
                     font-size: 14px; color: root.c-dim;
                     horizontal-alignment: center;
                     vertical-alignment: center;
-                    visible: !root.has-doc;
+                    vertical-stretch: 1;
                 }
+            }
+            // toast minimalista: pastilla centrada abajo, clic para cerrar
+            if (root.popup-text != ""): Rectangle {
+                width: min(520px, parent.width - 32px);
+                height: 52px;
+                x: (parent.width - self.width) / 2;
+                y: parent.height - self.height - 16px;
+                background: root.c-accent; border-radius: 8px;
+                HorizontalLayout {
+                    padding-left: 14px; padding-right: 14px; spacing: 10px;
+                    Text {
+                        text: root.popup-text;
+                        color: root.c-accent-fg; font-size: 13px;
+                        horizontal-stretch: 1; vertical-alignment: center;
+                        wrap: word-wrap; overflow: elide;
+                    }
+                    Text { text: "✕"; color: root.c-accent-fg; font-size: 12px; vertical-alignment: center; }
+                }
+                TouchArea { width: parent.width; height: parent.height; clicked => { root.popup-dismiss(); } }
             }
         }
     }
