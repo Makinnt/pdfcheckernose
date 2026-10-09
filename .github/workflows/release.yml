@@ -35,9 +35,9 @@ jobs:
           mkdir -p /tmp/jdk && tar xzf /tmp/jdk.tar.gz -C /tmp/jdk --strip-components=1
 
       - name: Stage AppDir
-        run: |
-          export JAVA_HOME=/tmp/jdk
-          ./installer/linux/stage-appimage.sh
+        env:
+          JAVA_HOME: /tmp/jdk
+        run: ./installer/linux/stage-appimage.sh
 
       - name: Smoke test (JRE + LT real)
         run: |

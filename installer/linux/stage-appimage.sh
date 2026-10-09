@@ -21,17 +21,19 @@ else
   echo 'AVISO: sin assets/lt (¿falló la descarga en build?). El AppImage pedirá lt/ igualmente.' >&2
 fi
 
-# JRE minimizado con jlink (~40-60MB). Usa el JDK del sistema o $JAVA_HOME.
+# JRE minimizado con jlink (~40-60MB). Orden: $JAVA_HOME, jlink del sistema
+# (solo si es 17+; en CI el runner trae un 11 que NO sirve para LT), o nada.
+pick_jlink() {
+  sys=$(command -v jlink 2>/dev/null || true)
+  for c in "${JAVA_HOME:-}/bin/jlink" "$sys"; do
+    [ -n "$c" ] && [ -x "$c" ] || continue
+    v=$("$c" --version 2>/dev/null | grep -o '[0-9]\+' | head -n 1)
+    if [ "${v:-0}" -ge 17 ]; then echo "$c"; return 0; fi
+  done
+  return 1
+}
 if [ ! -x "$APPDIR/usr/share/lexpdf/jre/bin/java" ]; then
-  if command -v jlink >/dev/null 2>&1; then
-    JLINK=jlink
-  elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/jlink" ]; then
-    JLINK="$JAVA_HOME/bin/jlink"
-  else
-    echo 'AVISO: sin jlink (instala un JDK 17+ o define JAVA_HOME). AppImage sin JRE.' >&2
-    JLINK=""
-  fi
-  if [ -n "$JLINK" ]; then
+  if JLINK=$(pick_jlink); then
     "$JLINK" --compress=2 --strip-debug --no-header-files --no-man-pages \
       --add-modules java.base,java.logging,java.xml,java.naming,java.management,java.sql,java.desktop,java.net.http,jdk.httpserver,jdk.unsupported \
       --output "$APPDIR/usr/share/lexpdf/jre"

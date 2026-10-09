@@ -14,13 +14,24 @@ if (Test-Path assets/lt/languagetool-server.jar) {
 } else {
   Write-Warning 'Sin assets/lt (¿falló la descarga en build?). El instalador pedirá Java igualmente.'
 }
-# JRE minimizado con jlink (~40-60MB). Usa el JDK del sistema o $JAVA_HOME;
-# si no hay JDK, cae al JRE completo de Temurin 21.
+# JRE minimizado con jlink (~40-60MB). Orden: $JAVA_HOME, jlink del sistema
+# (solo si es 17+); si no hay JDK, cae al JRE completo de Temurin 21.
 $Modules = 'java.base,java.logging,java.xml,java.naming,java.management,java.sql,java.desktop,java.net.http,jdk.httpserver,jdk.unsupported'
+function Find-Jlink {
+  $cands = @()
+  if ($env:JAVA_HOME) { $cands += Join-Path $env:JAVA_HOME 'bin/jlink.exe' }
+  $cands += (Get-Command jlink -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
+  foreach ($c in $cands) {
+    if ($c -and (Test-Path $c)) {
+      $v = & $c --version 2>$null | Select-Object -First 1
+      if ($v -match '(\d+)') { if ([int]$Matches[1] -ge 17) { return $c } }
+    }
+  }
+  return $null
+}
 if (-not (Test-Path dist/windows/jre/bin/java.exe)) {
-  $jlink = Get-Command jlink -ErrorAction SilentlyContinue
-  if (-not $jlink -and $env:JAVA_HOME) { $jlink = Join-Path $env:JAVA_HOME 'bin/jlink.exe' }
-  if ($jlink -and (Test-Path $jlink)) {
+  $jlink = Find-Jlink
+  if ($jlink) {
     Write-Host 'Generando JRE con jlink...'
     & $jlink --compress=2 --strip-debug --no-header-files --no-man-pages `
       --add-modules $Modules --output dist/windows/jre
