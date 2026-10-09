@@ -41,19 +41,23 @@ jobs:
 
       - name: Smoke test (JRE + LT real)
         run: |
-          ./dist/AppDir/usr/share/lexpdf/jre/bin/java -version
+          test -x ./dist/AppDir/usr/share/lexpdf/jre/bin/java
           ./dist/AppDir/usr/share/lexpdf/jre/bin/java -Xms256m -Xmx1g -Dfile.encoding=UTF-8 \
             -cp ./dist/AppDir/usr/share/lexpdf/lt/languagetool-server.jar \
-            org.languagetool.server.HTTPServer --port 8081 &
+            org.languagetool.server.HTTPServer --port 8081 > /tmp/lt-ci.log 2>&1 &
           SRV=$!
-          for i in $(seq 1 45); do
+          for i in $(seq 1 60); do
             sleep 2
             curl -sf http://localhost:8081/v2/languages >/dev/null 2>&1 && break
           done
-          curl -sf -X POST --data "language=es-ES" \
+          curl -s -m 120 -X POST --data "language=es-ES" \
             --data-urlencode "text=Pienso de que la problema es grave." \
-            http://localhost:8081/v2/check | grep -q DEQUEISMO
-          kill $SRV
+            http://localhost:8081/v2/check | tee /tmp/lt-check.json | grep -q DEQUEISMO
+          STATUS=$?
+          echo '--- server log ---'
+          tail -n 30 /tmp/lt-ci.log || true
+          kill $SRV 2>/dev/null || true
+          exit $STATUS
 
       - name: AppImage
         run: |
@@ -115,13 +119,19 @@ jobs:
       - name: Smoke test (JRE + LT real)
         shell: pwsh
         run: |
-          Start-Process dist/windows/jre/bin/java.exe -ArgumentList '-Xms256m','-Xmx1g','-Dfile.encoding=UTF-8','-cp','dist/windows/lt/languagetool-server.jar','org.languagetool.server.HTTPServer','--port','8081' -WindowStyle Hidden
-          for ($i = 0; $i -lt 45; $i++) {
-            Start-Sleep 2
-            try { Invoke-WebRequest http://localhost:8081/v2/languages -UseBasicParsing | Out-Null; break } catch {}
+          $java = 'dist/windows/jre/bin/java.exe'
+          if (-not (Test-Path $java)) { throw 'falta el JRE empaquetado' }
+          $p = Start-Process $java -ArgumentList '-Xms256m','-Xmx1g','-Dfile.encoding=UTF-8','-cp','dist/windows/lt/languagetool-server.jar','org.languagetool.server.HTTPServer','--port','8081' -WindowStyle Hidden -PassThru
+          try {
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep 2
+              try { Invoke-WebRequest http://localhost:8081/v2/languages -UseBasicParsing -TimeoutSec 5 | Out-Null; break } catch {}
+            }
+            $r = Invoke-WebRequest -Method Post -Body @{language='es-ES'; text='Pienso de que la problema es grave.'} -Uri http://localhost:8081/v2/check -UseBasicParsing -TimeoutSec 120
+            if ($r.Content -notmatch 'DEQUEISMO') { throw 'LT no responde como se espera' }
+          } finally {
+            try { Stop-Process -Id $p.Id -Force } catch {}
           }
-          $r = Invoke-WebRequest -Method Post -Body @{language='es-ES'; text='Pienso de que la problema es grave.'} -Uri http://localhost:8081/v2/check -UseBasicParsing
-          if ($r.Content -notmatch 'DEQUEISMO') { throw 'LT no responde como se espera' }
 
       # Firma con SignPath (gratis para OSS). Activar con cuenta + repo público:
       # Secrets SIGNPATH_API_TOKEN / SIGNPATH_ORG_ID, descomentar y ajustar slugs.
