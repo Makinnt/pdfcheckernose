@@ -2,12 +2,10 @@
 
 use std::{
     cell::RefCell,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
-    sync::{
-        OnceLock,
-        mpsc::{Sender, channel},
-    },
+    sync::mpsc::{Sender, channel},
 };
 
 use anyhow::Context;
@@ -37,13 +35,20 @@ struct State {
     page_h: f32,
     img_w: u32,
     img_h: u32,
-    all_errs: Vec<Misspelling>, // hallazgos de todo el doc (Fase 3+4)
-    view: Vec<usize>, // índices a all_errs tras aplicar el filtro de tipo
+    all_errs: Vec<Misspelling>, // hallazgos de todo el doc (LT: ortografía + sintaxis)
+    view: Vec<usize>, // índices a all_errs tras aplicar los filtros
+    view_group: Vec<Option<String>>, // paralela a view: Some(word) si la fila es grupo colapsado
+    expanded: HashSet<String>, // palabras desagrupadas por el usuario (grupo 5+)
     flash: Option<(usize, std::time::Instant)>, // error resaltado en amarillo
-    scan_id: u64,           // generación del escaneo vigente; invalida Sug viejos
+    scan_id: u64,           // generación del escaneo vigente; invalida Syn viejos
     scan_queue: Vec<u32>,   // páginas pendientes (orden desde la visible)
     scan_pos: usize,
-    dicts_ready: bool,
+    popup_until: Option<std::time::Instant>, // toast visible hasta este instante
+    zoom: f32,                               // 0.5 = ~700px de ancho (cabe); pasos ×1.25
+    free_pt: Option<(u32, f32, f32)>, // nota libre pendiente: (página, x, y en puntos PDF)
+    lt_ready: bool, // sidecar LanguageTool respondiendo en localhost:8081
+    lt_dead: bool,  // LT no va a arrancar (sin java): el scan avanza sin sintaxis
+    lt_child: Option<std::process::Child>, // hijo java propio (None si se reutiliza uno externo)
     tx: Sender<SpellMsg>,
     last_lang: i32,
 }
@@ -58,159 +63,333 @@ struct Misspelling {
     x1: f32,
     y1: f32,
     dismissed: bool,
-    kind: String, // Error | Mayúscula | Sigla (colores de index.html)
+    kind: String, // Ortografía | Sintaxis (por categoría LT: TYPOS vs resto)
+    sev: String,  // mínima | intermedia | grave
 }
 
-/// Error: palabra desconocida. Mayúscula: posible nombre propio. Sigla: posible acrónimo.
-fn kind_of(w: &str) -> &'static str {
-    if w.len() > 1 && w.chars().all(|c| !c.is_alphabetic() || c.is_uppercase()) {
-        "Sigla"
-    } else if w.chars().next().is_some_and(|c| c.is_uppercase()) {
-        "Mayúscula"
-    } else {
-        "Error"
+/// Clase por categoría LT: TYPOS (incluye MORFOLOGIK de ES/EN) = ortografía.
+fn kind_of_lt(cat: &str) -> &'static str {
+    if cat == "TYPOS" { "Ortografía" } else { "Sintaxis" }
+}
+
+/// Gravedad desde la categoría de regla LT (rule.category.id):
+/// gramática = grave, puntuación = intermedia, estilo = mínima;
+/// TYPOS = intermedia (como la falta clara de antes).
+fn sev_of_lt(cat: &str) -> &'static str {
+    match cat {
+        "GRAMMAR" | "SEMANTICS" => "grave",
+        "TYPOS" | "PUNCTUATION" | "CASING" => "intermedia",
+        _ => "mínima", // STYLE, TYPOGRAPHY, REDUNDANCY, etc.
     }
 }
 
-fn kind_bar(kind: &str) -> slint::Color {
-    match kind {
-        "Mayúscula" => slint::Color::from_rgb_u8(25, 118, 210),
-        "Sigla" => slint::Color::from_rgb_u8(245, 124, 0),
-        _ => slint::Color::from_rgb_u8(211, 47, 47),
+/// Peor gravedad de un grupo (grave > intermedia > mínima).
+fn worst_sev<'a, I>(sevs: I) -> &'static str
+where
+    I: Iterator<Item = &'a str> + Clone,
+{
+    for s in ["grave", "intermedia", "mínima"] {
+        if sevs.clone().any(|x| x == s) {
+            return s;
+        }
+    }
+    "mínima"
+}
+
+fn kind_bar(sev: &str) -> slint::Color {
+    match sev {
+        "grave" => slint::Color::from_rgb_u8(211, 47, 47),
+        "intermedia" => slint::Color::from_rgb_u8(245, 124, 0),
+        _ => slint::Color::from_rgb_u8(25, 118, 210),
     }
 }
 
 fn desc_for(kind: &str, en: bool) -> &'static str {
     match (kind, en) {
-        ("Mayúscula", false) => "Mayúscula no reconocida (¿nombre propio?)",
-        ("Mayúscula", true) => "Unrecognized capitalized word (proper noun?)",
-        ("Sigla", false) => "Sigla no reconocida (¿acrónimo?)",
-        ("Sigla", true) => "Unrecognized acronym",
-        (_, false) => "Posible falta de ortografía",
-        (_, true) => "Possible spelling mistake",
+        ("Sintaxis", false) => "Posible error de sintaxis (LanguageTool)",
+        ("Sintaxis", true) => "Possible grammar issue (LanguageTool)",
+        (_, false) => "Posible falta de ortografía (LanguageTool)",
+        (_, true) => "Possible spelling mistake (LanguageTool)",
     }
 }
 
 enum SpellEvent {
-    DictsReady,
-    Sug(u64, usize, Vec<String>), // (gen, índice en all_errs, sugerencias)
+    LtReady(Option<std::process::Child>), // hijo java propio (None si se reutiliza externo)
+    LtFail(String), // java ausente o LT no arranca: sin revisión hasta que haya servidor
+    Syn(u64, Vec<Misspelling>), // (gen, hallazgos LT de una página: ortografía + sintaxis)
 }
 type SpellMsg = SpellEvent;
 
-static DICT_ES: OnceLock<Result<zspell::Dictionary, String>> = OnceLock::new();
-static DICT_EN: OnceLock<Result<zspell::Dictionary, String>> = OnceLock::new();
+const LT_PORT: u16 = 8081;
 
-fn dict_base() -> PathBuf {
+/// Dónde vive LanguageTool desempaquetado: $LT_HOME → junto al exe → assets/lt.
+fn lt_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("LT_HOME") {
+        let j = PathBuf::from(p).join("languagetool-server.jar");
+        if j.is_file() {
+            return j.parent().map(|d| d.to_path_buf());
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(d) = exe.parent() {
-            let p = d.join("dicts");
-            if p.is_dir() {
-                return p;
+            for c in [d.join("lt/languagetool-server.jar"), d.join("languagetool-server.jar")] {
+                if c.is_file() {
+                    return c.parent().map(|d| d.to_path_buf());
+                }
             }
         }
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/dicts")
-}
-
-fn load_dict(which: &str) -> anyhow::Result<zspell::Dictionary> {
-    let base = dict_base();
-    let aff = std::fs::read_to_string(base.join(format!("{which}.aff")))?;
-    let dic = std::fs::read_to_string(base.join(format!("{which}.dic")))?;
-    Ok(zspell::builder().config_str(&aff).dict_str(&dic).build()?)
-}
-
-fn dict_cached(which: &str) -> anyhow::Result<&'static zspell::Dictionary> {
-    let lock = if which == "en_US" { &DICT_EN } else { &DICT_ES };
-    lock.get_or_init(|| load_dict(which).map_err(|e| format!("{e:#}")))
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("dict {which}: {e}"))
-}
-
-fn suggest_in(d: &zspell::Dictionary, w: &str) -> Vec<String> {
-    d.entry(w).suggest().unwrap_or_default().iter().take(5).map(|s| s.to_string()).collect()
-}
-
-/// mode: 0 auto, 1 es, 2 en. Error en auto = falla en ambos.
-/// Devuelve (índice en words, palabra). Rápido: solo check().
-fn check_words(words: &[Word], mode: i32) -> Vec<(usize, String)> {
-    let es = (mode != 2).then(|| dict_cached("es_ES").ok()).flatten();
-    let en = (mode != 1).then(|| dict_cached("en_US").ok()).flatten();
-    if es.is_none() && en.is_none() {
-        return vec![];
+    let m = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/lt/languagetool-server.jar");
+    if m.is_file() {
+        return m.parent().map(|d| d.to_path_buf());
     }
+    None
+}
+
+fn lt_url(path: &str) -> String {
+    format!("http://localhost:{LT_PORT}{path}")
+}
+
+/// ¿Hay un servidor LT respondiendo? (sirve para reutilizar uno ya abierto).
+fn lt_alive() -> bool {
+    ureq::get(&lt_url("/v2/languages"))
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(3)))
+        .build()
+        .call()
+        .is_ok()
+}
+
+/// Un chequeo /v2/check crudo: devuelve (offset_chars, len_chars, reemplazos<=3, categoría).
+fn lt_check(text: &str, lang: &str) -> Vec<(usize, usize, Vec<String>, String)> {
+    let body = match ureq::post(&lt_url("/v2/check"))
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .build()
+        .send_form([("language", lang), ("text", text)])
+    {
+        Ok(mut r) => match r.body_mut().read_to_string() {
+            Ok(b) => b,
+            Err(_) => return vec![],
+        },
+        Err(_) => return vec![],
+    };
+    let v: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
     let mut out = vec![];
-    for (wi, w) in words.iter().enumerate() {
-        if w.text.chars().any(|c| c.is_numeric()) {
-            continue;
-        }
-        let ok_es = es.map(|d| d.check(&w.text)).unwrap_or(false);
-        let ok_en = en.map(|d| d.check(&w.text)).unwrap_or(false);
-        let ok = match mode {
-            1 => ok_es,
-            2 => ok_en,
-            _ => ok_es || ok_en,
-        };
-        if !ok {
-            out.push((wi, w.text.clone()));
+    if let Some(ms) = v.get("matches").and_then(|m| m.as_array()) {
+        for m in ms.iter().take(40) {
+            let (o, l) = (m.get("offset").and_then(|x| x.as_u64()), m.get("length").and_then(|x| x.as_u64()));
+            let (Some(o), Some(l)) = (o, l) else { continue };
+            let mut rep: Vec<String> = m
+                .get("replacements")
+                .and_then(|r| r.as_array())
+                .map(|a| a.iter().filter_map(|x| x.get("value").and_then(|v| v.as_str()).map(|s| s.to_string())).take(3).collect())
+                .unwrap_or_default();
+            rep.retain(|r| !r.is_empty());
+            if rep.is_empty() || l == 0 {
+                continue;
+            }
+            let cat = m
+                .get("rule")
+                .and_then(|r| r.get("category"))
+                .and_then(|c| c.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            out.push((o as usize, l as usize, rep, cat));
         }
     }
     out
 }
 
-/// ponytail: suggest() escanea todo el wordlist; solo bajo demanda y en fondo
-fn suggest_for(word: &str, mode: i32) -> Vec<String> {
-    let es = (mode != 2).then(|| dict_cached("es_ES").ok()).flatten();
-    let en = (mode != 1).then(|| dict_cached("en_US").ok()).flatten();
-    let mut sug = vec![];
-    if mode != 2 {
-        if let Some(d) = es {
-            sug.extend(suggest_in(d, word));
+/// Une palabras con un espacio y anota el rango (en chars, como la API de LT)
+/// de cada una. Puro y testeable.
+fn join_words(words: &[Word]) -> (String, Vec<std::ops::Range<usize>>) {
+    let mut text = String::new();
+    let mut ranges = Vec::with_capacity(words.len());
+    for w in words {
+        if !text.is_empty() {
+            text.push(' ');
         }
+        let s = text.chars().count();
+        text.push_str(&w.text);
+        ranges.push(s..s + w.text.chars().count());
     }
-    if mode != 1 {
-        if let Some(d) = en {
-            for s in suggest_in(d, word) {
-                if !sug.contains(&s) {
-                    sug.push(s);
+    (text, ranges)
+}
+
+/// Mapea un span de bytes al box unión + frase de las palabras solapadas.
+fn span_to_box(words: &[Word], ranges: &[std::ops::Range<usize>], bs: usize, be: usize) -> Option<(f32, f32, f32, f32, String)> {
+    let mut hit: Option<(f32, f32, f32, f32, Vec<&str>)> = None;
+    for (w, r) in words.iter().zip(ranges.iter()) {
+        if r.start < be && bs < r.end {
+            hit = Some(match hit {
+                None => (w.x0, w.y0, w.x1, w.y1, vec![w.text.as_str()]),
+                Some((x0, y0, x1, y1, mut ws)) => {
+                    ws.push(w.text.as_str());
+                    (x0.min(w.x0), y0.min(w.y0), x1.max(w.x1), y1.max(w.y1), ws)
                 }
-            }
+            });
         }
     }
-    sug.truncate(5);
-    sug
+    hit.map(|(x0, y0, x1, y1, ws)| (x0, y0, x1, y1, ws.join(" ")))
+}
+
+/// Pasa LanguageTool sobre el texto de una página y devuelve TODOS los
+/// hallazgos (ortografía si categoría TYPOS, sintaxis el resto).
+/// Corre en hilo fondo (HTTP sync); nunca en el Timer.
+/// mode: 0 auto (es+en sin solapes), 1 es, 2 en.
+fn syntax_page(words: &[Word], page: u32, mode: i32) -> Vec<Misspelling> {
+    let (text, ranges) = join_words(words);
+    if text.is_empty() {
+        return vec![];
+    }
+    let langs: &[&str] = match mode {
+        1 => &["es-ES"],
+        2 => &["en-US"],
+        _ => &["es-ES", "en-US"],
+    };
+    // (char_start, char_end, sugs, categoría); en auto el primer idioma que marca gana el solape
+    let mut spans: Vec<(usize, usize, Vec<String>, String)> = vec![];
+    for lang in langs {
+        for (o, l, rep, cat) in lt_check(&text, lang) {
+            let be = o + l;
+            if be > text.chars().count() {
+                continue;
+            }
+            if spans.iter().any(|(a, b, _, _)| *a < be && o < *b) {
+                continue;
+            }
+            spans.push((o, be, rep, cat));
+        }
+    }
+    spans.sort_by_key(|(bs, _, _, _)| *bs);
+    let mut out = vec![];
+    for (bs, be, rep, cat) in spans {
+        if let Some((x0, y0, x1, y1, phrase)) = span_to_box(words, &ranges, bs, be) {
+            out.push(Misspelling { word: phrase, sug: rep, page, x0, y0, x1, y1, dismissed: false, kind: kind_of_lt(&cat).into(), sev: sev_of_lt(&cat).into() });
+        }
+    }
+    out
+}
+
+/// Toast de 4s para mensajes transitorios; el `status` queda para info persistente.
+fn notify(ui: &AppWindow, st: &Rc<RefCell<State>>, msg: String) {
+    ui.set_popup_text(msg.into());
+    st.borrow_mut().popup_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
+}
+
+/// ¿Se pisan dos boxes de la misma página? (p. ej. ortografía "de" y sintaxis "de de")
+fn boxes_overlap(a: &Misspelling, b: &Misspelling) -> bool {
+    a.page == b.page && a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1
+}
+
+/// Orden de aparición: página asc, luego de arriba abajo (y1 desc),
+/// luego de izquierda a derecha. Puro y testeable.
+fn err_order(a: &Misspelling, b: &Misspelling) -> std::cmp::Ordering {
+    a.page
+        .cmp(&b.page)
+        .then(b.y1.total_cmp(&a.y1))
+        .then(a.x0.total_cmp(&b.x0))
 }
 
 fn push_errs(ui: &AppWindow, st: &Rc<RefCell<State>>) {
-    let filter = ui.get_err_filter();
     let en = ui.get_lang_idx() == 2;
-    let all = st.borrow().all_errs.clone();
-    let mut view = vec![];
-    let mut rows = vec![];
+    let (all, expanded) = {
+        let s = st.borrow();
+        (s.all_errs.clone(), s.expanded.clone())
+    };
+    // índices filtrados en orden de aparición
+    // tipo: 0 todas · 1 ortografía · 2 sintaxis | sev: 0 todas · 1 grave · 2 intermedia · 3 mínima
+    let (tfilter, sfilter) = (ui.get_type_filter(), ui.get_sev_filter());
+    let mut filt: Vec<usize> = vec![];
     for (gi, e) in all.iter().enumerate() {
-        if filter == 1 && e.kind != "Error"
-            || filter == 2 && e.kind != "Mayúscula"
-            || filter == 3 && e.kind != "Sigla"
+        if tfilter == 1 && e.kind != "Ortografía"
+            || tfilter == 2 && e.kind != "Sintaxis"
+            || sfilter == 1 && e.sev != "grave"
+            || sfilter == 2 && e.sev != "intermedia"
+            || sfilter == 3 && e.sev != "mínima"
         {
             continue;
         }
-        view.push(gi);
-        rows.push(ErrRow {
-            word: e.word.clone().into(),
-            sug: if e.sug.is_empty() {
-                (if en { "No suggestions" } else { "No hay sugerencias" }).into()
+        filt.push(gi);
+    }
+    // orden de aparición en el documento (no orden de llegada de los hilos)
+    filt.sort_by(|a, b| err_order(&all[*a], &all[*b]));
+    // conteo por palabra para agrupar 5+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for gi in &filt {
+        *counts.entry(all[*gi].word.as_str()).or_insert(0) += 1;
+    }
+    let mut view = vec![];
+    let mut view_group: Vec<Option<String>> = vec![];
+    let mut rows = vec![];
+    let mut grouped_done: HashSet<&str> = HashSet::new();
+    for gi in filt {
+        let e = &all[gi];
+        let n = counts.get(e.word.as_str()).copied().unwrap_or(1);
+        let grouped = n >= 5 && !expanded.contains(&e.word);
+        if grouped {
+            if !grouped_done.insert(e.word.as_str()) {
+                continue; // una sola card por grupo
+            }
+            // primera ocurrencia como lead; sug del cache o del primer miembro con sugs
+            let lead = gi;
+            let sug = if !e.sug.is_empty() {
+                e.sug.clone()
             } else {
-                e.sug.join(", ").into()
-            },
-            page: e.page as i32,
-            dimmed: e.dismissed,
-            kind: e.kind.clone().into(),
-            bar: kind_bar(&e.kind),
-            desc: desc_for(&e.kind, en).into(),
-        });
+                all.iter().find(|x| x.word == e.word && !x.sug.is_empty()).map(|x| x.sug.clone()).unwrap_or_default()
+            };
+            let dimmed = all.iter().filter(|x| x.word == e.word).all(|x| x.dismissed);
+            // gravedad del grupo = la peor de sus miembros
+            let gsev = worst_sev(all.iter().filter(|x| x.word == e.word).map(|x| x.sev.as_str()));
+            view.push(lead);
+            view_group.push(Some(e.word.clone()));
+            rows.push(ErrRow {
+                word: format!("{} (×{n})", e.word).into(),
+                sug: if sug.is_empty() {
+                    (if en { "No suggestions" } else { "No hay sugerencias" }).into()
+                } else {
+                    format!("→ {} | {}", sug.join(", "), if en { "tap for pages" } else { "toca para ver páginas" }).into()
+                },
+                page: e.page as i32,
+                dimmed,
+                kind: e.kind.clone().into(),
+                sev: gsev.into(),
+                bar: kind_bar(gsev),
+                desc: (if en { format!("Repeated {n} times — comment/reject applies to all") } else { format!("Se repite {n} veces — comentar/rechazar aplica a todas") }).into(),
+                count: n as i32,
+                is_group: true,
+            });
+        } else {
+            view.push(gi);
+            view_group.push(None);
+            rows.push(ErrRow {
+                word: e.word.clone().into(),
+                sug: if e.sug.is_empty() {
+                    (if en { "No suggestions" } else { "No hay sugerencias" }).into()
+                } else {
+                    format!("→ {}", e.sug.join(", ")).into()
+                },
+                page: e.page as i32,
+                dimmed: e.dismissed,
+                kind: e.kind.clone().into(),
+                sev: e.sev.clone().into(),
+                bar: kind_bar(&e.sev),
+                desc: desc_for(&e.kind, en).into(),
+                count: n as i32,
+                is_group: false,
+            });
+        }
     }
     st.borrow_mut().view = view;
+    st.borrow_mut().view_group = view_group;
     ui.set_errors(ModelRc::new(VecModel::from_slice(&rows)));
-    ui.set_spell_status(format!("{} errores", rows.len()).into());
+    let graves = all.iter().filter(|e| e.sev == "grave").count();
+    ui.set_spell_status(format!("{} errores ({} grave)", rows.len(), graves).into());
 }
 
 /// Prepara el escaneo TODO el documento; el Timer lo avanza por trozos.
@@ -223,6 +402,8 @@ fn start_scan(ui: &AppWindow, st: &mut State) {
     }
     st.scan_id += 1;
     st.all_errs.clear();
+    st.view.clear();
+    st.view_group.clear();
     st.scan_queue = (st.page..total).chain(0..st.page).collect();
     st.scan_pos = 0;
     st.last_lang = ui.get_lang_idx();
@@ -233,58 +414,66 @@ fn start_scan(ui: &AppWindow, st: &mut State) {
     ui.set_spell_status("…".into());
 }
 
-/// Avanza el escaneo con presupuesto de 80ms por tick para no trabar la UI.
+/// Avanza la extracción con presupuesto de 80ms por tick y lanza el chequeo
+/// LT en fondo (un hilo por página, solo HTTP). Sin servidor no avanza:
+/// sin motor no hay nada que mostrar.
 /// Devuelve true si llegaron hits de la página visible (hay que re-subrayar).
 fn scan_tick(ui: &AppWindow, st: &Rc<RefCell<State>>) -> bool {
     {
         let s = st.borrow();
-        if s.scan_pos >= s.scan_queue.len() || !s.dicts_ready || s.path.is_none() {
+        if s.scan_pos >= s.scan_queue.len() || (!s.lt_ready && !s.lt_dead) || s.path.is_none() {
             return false;
         }
     }
+    // sin LT solo queda esperar al sidecar; no se consume cola para no perder páginas.
+    // Si LT murió (lt_dead), se consume igual para que la barra termine (lista vacía).
+    let dead = st.borrow().lt_dead;
     let mode = ui.get_lang_idx();
     let t = std::time::Instant::now();
-    let mut advanced = false;
-    let mut touched = false;
+    let mut jobs: Vec<(Vec<Word>, u32, i32, u64, Sender<SpellMsg>)> = vec![];
     {
         let mut s = st.borrow_mut();
         let Some(path) = s.path.clone() else { return false };
-        let cur = s.page;
         while s.scan_pos < s.scan_queue.len() && t.elapsed() < std::time::Duration::from_millis(80) {
             let i = s.scan_queue[s.scan_pos];
             s.scan_pos += 1;
-            advanced = true;
-            let hits = {
+            let words = {
                 let Ok(doc) = s.pdfium.load_pdf_from_file(&path, None) else { continue };
                 let Ok(pg) = doc.pages().get(i as u16) else { continue };
-                let words = extract_words(&pg);
-                let mut h = vec![];
-                for (wi, w) in check_words(&words, mode) {
-                    let b = &words[wi];
-                    let kind = kind_of(&w).to_string();
-                    h.push(Misspelling { word: w, sug: vec![], page: i, x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1, dismissed: false, kind });
-                }
-                h
+                extract_words(&pg)
             };
-            if hits.iter().any(|h| h.page == cur) {
-                touched = true;
+            if !dead {
+                jobs.push((words, i, mode, s.scan_id, s.tx.clone()));
             }
-            s.all_errs.extend(hits);
         }
-        let (done, total) = (s.scan_pos as u32, s.scan_queue.len() as u32);
-        let pct = if total == 0 { 100 } else { done * 100 / total };
-        ui.set_scan_progress(pct as i32);
-        if s.scan_pos >= s.scan_queue.len() {
-            ui.set_scanning(false);
-            ui.set_scan_text("".into());
-        } else {
-            ui.set_scan_text(format!("{pct}% · pág. {done} de {total}…").into());
-        }
+        refresh_progress(ui, &s);
     }
-    if advanced {
+    let launched = !jobs.is_empty();
+    for (words, pg, mode, gen, tx) in jobs {
+        std::thread::spawn(move || {
+            let hits = syntax_page(&words, pg, mode);
+            if !hits.is_empty() {
+                let _ = tx.send(SpellEvent::Syn(gen, hits));
+            }
+        });
+    }
+    if launched {
         push_errs(ui, st);
     }
-    touched
+    false
+}
+
+/// Barra única: páginas extraídas de la cola (los hits LT llegan async).
+fn refresh_progress(ui: &AppWindow, s: &State) {
+    let (len, done) = (s.scan_queue.len() as u32, s.scan_pos.min(s.scan_queue.len()) as u32);
+    let pct = if len == 0 { 100 } else { done * 100 / len };
+    ui.set_scan_progress(pct as i32);
+    if len > 0 && done >= len {
+        ui.set_scanning(false);
+        ui.set_scan_text("".into());
+    } else {
+        ui.set_scan_text(format!("{pct}% · pág. {done} de {len}…").into());
+    }
 }
 
 /// Agrupa chars de Pdfium en palabras con su bounding box unión.
@@ -336,9 +525,10 @@ fn extract_words(page: &PdfPage) -> Vec<Word> {
     words
 }
 
-/// Subrayado rojo quemado en el bitmap (siempre alineado, sin mates de layout).
-/// Dibuja 3px al pie del box, mezcla 65% rojo #d32f2f sobre el fondo.
-fn underline(img: &mut image::RgbaImage, x: f32, y: f32, w: f32) {
+/// Subrayado quemado en el bitmap (siempre alineado, sin mates de layout).
+/// Dibuja 3px al pie del box, mezcla 65% del color dado sobre el fondo.
+/// Ortografía = rojo #d32f2f, sintaxis = morado #6a1b9a.
+fn underline(img: &mut image::RgbaImage, x: f32, y: f32, w: f32, col: (u8, u8, u8)) {
     let (iw, ih) = (img.width() as i64, img.height() as i64);
     let (x0, y0) = (x.round() as i64, y.round() as i64);
     for dx in 0..(w.round() as i64).max(4) {
@@ -348,11 +538,15 @@ fn underline(img: &mut image::RgbaImage, x: f32, y: f32, w: f32) {
                 continue;
             }
             let p = img.get_pixel_mut(px as u32, py as u32);
-            p[0] = (p[0] as u16 * 35 / 100 + 211 * 65 / 100) as u8;
-            p[1] = (p[1] as u16 * 35 / 100 + 47 * 65 / 100) as u8;
-            p[2] = (p[2] as u16 * 35 / 100 + 47 * 65 / 100) as u8;
+            p[0] = (p[0] as u16 * 35 / 100 + col.0 as u16 * 65 / 100) as u8;
+            p[1] = (p[1] as u16 * 35 / 100 + col.1 as u16 * 65 / 100) as u8;
+            p[2] = (p[2] as u16 * 35 / 100 + col.2 as u16 * 65 / 100) as u8;
         }
     }
+}
+
+fn under_color(kind: &str) -> (u8, u8, u8) {
+    if kind == "Sintaxis" { (106, 27, 154) } else { (211, 47, 47) }
 }
 
 fn wash(img: &mut image::RgbaImage, x: f32, y: f32, w: f32, h: f32) {
@@ -380,24 +574,77 @@ fn pdf_to_image(x0: f32, y0: f32, x1: f32, y1: f32, pw: f32, ph: f32, iw: u32, i
     (x, y, w, h)
 }
 
+/// Guarda evitando truncar un archivo que Pdfium tiene mapeado
+/// (cuando base == destino): vía temporal + rename atómico.
+fn save_doc(doc: &PdfDocument, out: &PathBuf) -> anyhow::Result<()> {
+    let tmp = out.with_extension("tmp.pdf");
+    doc.save_to_file(&tmp).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    std::fs::rename(&tmp, out)?;
+    Ok(())
+}
+
+/// Destino de anotaciones + base a abrir: si ya existe `{nombre}_anotado.pdf`
+/// se anota ENCIMA (acumula), si no se parte del original. Nunca se toca el original.
+/// ponytail: si el _anotado es de otra sesión con otro estado, igual vale (mismo layout)
+fn annotate_base(st: &State) -> anyhow::Result<(PdfDocument, PathBuf)> {
+    let src = st.path.clone().context("sin documento")?;
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
+    let out = src.with_file_name(format!("{stem}_anotado.pdf"));
+    let base = if out.is_file() { &out } else { &src };
+    let doc = st.pdfium.load_pdf_from_file(base, None).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    Ok((doc, out))
+}
+
 /// Inyecta una nota nativa (sticky-note) en el box del error y guarda
 /// en `{nombre}_anotado.pdf`. Nunca sobreescribe el original.
 fn annotate(st: &State, idx: usize, text: &str) -> anyhow::Result<PathBuf> {
     let e = st.all_errs.get(idx).context("hallazgo no válido")?;
-    let src = st.path.clone().context("sin documento")?;
+    st.path.clone().context("sin documento")?;
     let text = if text.trim().is_empty() {
         format!("Revisar: {} (sugerencias: {})", e.word, e.sug.join(", "))
     } else {
         text.to_string()
     };
-    let doc = st.pdfium.load_pdf_from_file(&src, None).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let (doc, out) = annotate_base(st)?;
     let mut pg = doc.pages().get(e.page as u16).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let mut ann = pg.annotations_mut().create_text_annotation(&text).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     ann.set_bounds(PdfRect::new_from_values(e.y0, e.x0, e.y1, e.x1))
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
-    let out = src.with_file_name(format!("{stem}_anotado.pdf"));
-    doc.save_to_file(&out).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    save_doc(&doc, &out)?;
+    Ok(out)
+}
+
+/// Anota N hallazgos de una vez (grupo): abre el doc una sola vez.
+/// ponytail: evita N open/save que se pisaban; techo = todo el grupo en memoria, bien para <1000
+fn annotate_many(st: &State, idxs: &[usize], text: &str) -> anyhow::Result<PathBuf> {
+    st.path.clone().context("sin documento")?;
+    anyhow::ensure!(!idxs.is_empty(), "grupo vacío");
+    let (doc, out) = annotate_base(st)?;
+    for idx in idxs {
+        let e = st.all_errs.get(*idx).context("hallazgo no válido")?;
+        let t = if text.trim().is_empty() {
+            format!("Revisar: {} (sugerencias: {})", e.word, e.sug.join(", "))
+        } else {
+            text.to_string()
+        };
+        let mut pg = doc.pages().get(e.page as u16).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mut ann = pg.annotations_mut().create_text_annotation(&t).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        ann.set_bounds(PdfRect::new_from_values(e.y0, e.x0, e.y1, e.x1))
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    }
+    save_doc(&doc, &out)?;
+    Ok(out)
+}
+
+/// Nota libre en un punto cualquiera de la página (coords PDF, origen abajo-izq).
+fn annotate_at(st: &State, page: u32, x: f32, y: f32, text: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(!text.trim().is_empty(), "escribe la nota primero");
+    let (doc, out) = annotate_base(st)?;
+    let mut pg = doc.pages().get(page as u16).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let mut ann = pg.annotations_mut().create_text_annotation(text).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    ann.set_bounds(PdfRect::new_from_values((y - 6.0).max(0.0), (x - 6.0).max(0.0), y + 6.0, x + 6.0))
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    save_doc(&doc, &out)?;
     Ok(out)
 }
 
@@ -409,13 +656,13 @@ fn show(ui: &AppWindow, st: &mut State, page: u32) {
         let total = pages.len() as u32;
         let pg = pages.get(page as u16).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let (pw, ph) = (pg.width().value, pg.height().value);
-        let config = PdfRenderConfig::new().set_target_width(1400);
+        let config = PdfRenderConfig::new().set_target_width((1400.0 * st.zoom) as i32);
         let mut rgba = pg.render_with_config(&config).map_err(|e| anyhow::anyhow!("{e:?}"))?
             .as_image().as_rgba8().context("pdfium no devolvió RGBA")?.clone();
         let (iw, ih) = (rgba.width(), rgba.height());
         for h in st.all_errs.iter().filter(|e| e.page == page && !e.dismissed) {
             let (x, y, w, hh) = pdf_to_image(h.x0, h.y0, h.x1, h.y1, pw, ph, iw, ih);
-            underline(&mut rgba, x, y + hh - 3.0, w);
+            underline(&mut rgba, x, y + hh - 3.0, w, under_color(&h.kind));
         }
         // flash amarillo 5s del error clicado
         if let Some((fi, t)) = &st.flash {
@@ -447,9 +694,15 @@ fn show(ui: &AppWindow, st: &mut State, page: u32) {
             let sample: Vec<&str> = words.iter().take(12).map(|w| w.text.as_str()).collect();
             ui.set_word_sample(sample.join(" ").into());
             ui.set_status(format!("{} — {} págs. · {} palabras en pág. {}", path.display(), total, words.len(), page + 1).into());
+            ui.set_img_w(iw as i32);
+            ui.set_img_h(ih as i32);
+            ui.set_zoom_label(format!("{}%", (st.zoom * 100.0).round() as u32).into());
             st.words = words;
         }
-        Err(e) => ui.set_status(format!("Error: {e:#}").into()),
+        Err(e) => {
+            ui.set_popup_text(format!("Error: {e:#}").into());
+            st.popup_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
+        }
     }
 }
 
@@ -501,11 +754,18 @@ fn main() -> anyhow::Result<()> {
         img_h: 0,
         all_errs: vec![],
         view: vec![],
+        view_group: vec![],
+        expanded: HashSet::new(),
         flash: None,
         scan_id: 0,
         scan_queue: vec![],
         scan_pos: 0,
-        dicts_ready: false,
+        popup_until: None,
+        zoom: 0.5,
+        free_pt: None,
+        lt_ready: false,
+        lt_dead: false,
+        lt_child: None,
         tx,
         last_lang: 0,
     }));
@@ -517,33 +777,36 @@ fn main() -> anyhow::Result<()> {
         let st = st.clone();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            if st.borrow().path.is_some() && ui.get_lang_idx() != st.borrow().last_lang {
+            let lang_changed = st.borrow().path.is_some() && ui.get_lang_idx() != st.borrow().last_lang;
+            if lang_changed {
                 start_scan(&ui, &mut st.borrow_mut());
             }
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                    SpellEvent::DictsReady => {
-                        st.borrow_mut().dicts_ready = true;
-                        ui.set_dicts_ready(true);
+                    SpellEvent::LtReady(child) => {
+                        st.borrow_mut().lt_ready = true;
+                        st.borrow_mut().lt_child = child;
+                        notify(&ui, &st, "Revisión lista (LanguageTool local).".into());
                     }
-                    SpellEvent::Sug(gen, wi, sug) => {
+                    SpellEvent::LtFail(msg) => {
+                        st.borrow_mut().lt_dead = true;
+                        notify(&ui, &st, format!("Sin revisión: {msg}."));
+                    }
+                    SpellEvent::Syn(gen, hits) => {
                         if gen != st.borrow().scan_id {
                             continue;
                         }
-                        let ok = {
+                        let touched_cur = {
                             let mut s = st.borrow_mut();
-                            if let Some(e) = s.all_errs.get_mut(wi) {
-                                e.sug = sug;
-                                true
-                            } else {
-                                false
-                            }
+                            let cur = s.page;
+                            let t = hits.iter().any(|h| h.page == cur);
+                            s.all_errs.extend(hits);
+                            t
                         };
-                        if ok {
-                            push_errs(&ui, &st);
-                            if let Some(e) = st.borrow().all_errs.get(wi) {
-                                ui.set_status(format!("{} → {}", e.word, e.sug.join(", ")).into());
-                            }
+                        push_errs(&ui, &st);
+                        if touched_cur {
+                            let pg = st.borrow().page;
+                            show(&ui, &mut st.borrow_mut(), pg);
                         }
                     }
                 }
@@ -553,10 +816,17 @@ fn main() -> anyhow::Result<()> {
                 show(&ui, &mut st.borrow_mut(), pg);
             }
             // apaga el flash amarillo a los 5s
-            if st.borrow().flash.is_some_and(|(_, t)| t.elapsed() > std::time::Duration::from_secs(5)) {
+            let flash_out = st.borrow().flash.is_some_and(|(_, t)| t.elapsed() > std::time::Duration::from_secs(5));
+            if flash_out {
                 st.borrow_mut().flash = None;
                 let pg = st.borrow().page;
                 show(&ui, &mut st.borrow_mut(), pg);
+            }
+            // auto-cierra el toast
+            let popup_out = st.borrow().popup_until.is_some_and(|t| std::time::Instant::now() >= t);
+            if popup_out {
+                st.borrow_mut().popup_until = None;
+                ui.set_popup_text("".into());
             }
         }
     });
@@ -600,6 +870,103 @@ fn main() -> anyhow::Result<()> {
             }
         });
     }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_zoom_in(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let z = (st.borrow().zoom * 1.25).min(3.0);
+            st.borrow_mut().zoom = z;
+            let pg = st.borrow().page;
+            show(&ui, &mut st.borrow_mut(), pg);
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_zoom_out(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let z = (st.borrow().zoom / 1.25).max(0.5);
+            st.borrow_mut().zoom = z;
+            let pg = st.borrow().page;
+            show(&ui, &mut st.borrow_mut(), pg);
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_zoom_set(move |z| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if z.is_finite() {
+                st.borrow_mut().zoom = z.clamp(0.5, 3.0);
+            }
+            let pg = st.borrow().page;
+            show(&ui, &mut st.borrow_mut(), pg); // reescribe la etiqueta con el valor real
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_free_note_new(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let (pg, x, y) = {
+                let s = st.borrow();
+                (s.page, s.page_w / 2.0, s.page_h / 2.0)
+            };
+            st.borrow_mut().free_pt = Some((pg, x, y));
+            ui.set_free_note_text("".into());
+            ui.set_free_note_on(true);
+            notify(&ui, &st, format!("Nota en pág {} (centro): escribe y pulsa Guardar", pg + 1));
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_page_clicked(move |mx, my| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let s = st.borrow();
+            if s.img_w == 0 || s.img_h == 0 {
+                return;
+            }
+            // px de imagen 1:1 → puntos PDF (origen abajo-izq)
+            let x = (mx / s.img_w as f32 * s.page_w).clamp(0.0, s.page_w);
+            let y = (s.page_h - my / s.img_h as f32 * s.page_h).clamp(0.0, s.page_h);
+            let pg = s.page;
+            drop(s);
+            st.borrow_mut().free_pt = Some((pg, x, y));
+            ui.set_free_note_text("".into());
+            ui.set_free_note_on(true);
+            notify(&ui, &st, format!("Nota en pág {}: escribe y pulsa Guardar", pg + 1));
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_free_note_save(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let text = ui.get_free_note_text().to_string();
+            let pt = st.borrow().free_pt;
+            let res = match pt {
+                Some((pg, x, y)) => annotate_at(&st.borrow(), pg, x, y, &text),
+                None => Err(anyhow::anyhow!("toca primero el punto del PDF")),
+            };
+            match res {
+                Ok(out) => notify(&ui, &st, format!("Nota guardada en {} (reabre ese archivo para verla)", out.display())),
+                Err(e) => notify(&ui, &st, format!("Error al anotar: {e:#}")),
+            }
+            ui.set_free_note_on(false);
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_free_note_cancel(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_free_note_on(false);
+            }
+            st.borrow_mut().free_pt = None;
+        });
+    }
 
     {
         let ui_weak = ui.as_weak();
@@ -610,29 +977,21 @@ fn main() -> anyhow::Result<()> {
                 Some(g) => *g,
                 None => return,
             };
-            let (word, pg, has_sug) = match st.borrow().all_errs.get(gi) {
-                Some(e) => (e.word.clone(), e.page, !e.sug.is_empty()),
+            let (pg, detail) = match st.borrow().all_errs.get(gi) {
+                Some(e) => {
+                    let sugs = if e.sug.is_empty() { "".into() } else { format!(" → {}", e.sug.join(", ")) };
+                    (e.page, format!("{}{} · {} {} · pág {}", e.word, sugs, e.kind, e.sev, e.page + 1))
+                }
                 None => return,
             };
             st.borrow_mut().flash = Some((gi, std::time::Instant::now()));
-            if pg != st.borrow().page {
+            let cur = st.borrow().page;
+            if pg != cur {
                 show(&ui, &mut st.borrow_mut(), pg); // salto + flash amarillo
             } else {
-                let pg = st.borrow().page;
-                show(&ui, &mut st.borrow_mut(), pg);
+                show(&ui, &mut st.borrow_mut(), cur);
             }
-            if has_sug {
-                if let Some(e) = st.borrow().all_errs.get(gi) {
-                    ui.set_status(format!("{} → {}", e.word, e.sug.join(", ")).into());
-                }
-                return;
-            }
-            let (mode, tx, gen) = (ui.get_lang_idx(), st.borrow().tx.clone(), st.borrow().scan_id);
-            ui.set_status(format!("Buscando sugerencias para {word}…").into());
-            std::thread::spawn(move || {
-                let sug = suggest_for(&word, mode);
-                let _ = tx.send(SpellEvent::Sug(gen, gi, sug));
-            });
+            notify(&ui, &st, detail); // LT ya trae reemplazos; sin hilos aquí
         });
     }
     {
@@ -646,6 +1005,16 @@ fn main() -> anyhow::Result<()> {
     {
         let ui_weak = ui.as_weak();
         let st = st.clone();
+        ui.on_popup_dismiss(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_popup_text("".into());
+            }
+            st.borrow_mut().popup_until = None;
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
         ui.on_omit_clicked(move |i| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let pg = {
@@ -654,13 +1023,39 @@ fn main() -> anyhow::Result<()> {
                     Some(g) => *g,
                     None => return,
                 };
-                match s.all_errs.get_mut(gi) {
-                    Some(e) => {
-                        e.dismissed = !e.dismissed;
-                        s.page
+                let group = s.view_group.get(i as usize).cloned().flatten();
+                // índices objetivo: todo el grupo o la ocurrencia sola
+                let (targets, dismissing) = if let Some(w) = group {
+                    let all_off = s.all_errs.iter().filter(|e| e.word == w).all(|e| e.dismissed);
+                    let idxs: Vec<usize> = s.all_errs.iter().enumerate()
+                        .filter(|(_, e)| e.word == w).map(|(j, _)| j).collect();
+                    (idxs, !all_off)
+                } else {
+                    let to = !s.all_errs.get(gi).map(|e| e.dismissed).unwrap_or(true);
+                    (vec![gi], to)
+                };
+                for j in &targets {
+                    if let Some(e) = s.all_errs.get_mut(*j) {
+                        e.dismissed = dismissing;
                     }
-                    None => return,
                 }
+                // al omitir, apaga también lo solapado (otra clase sobre la misma zona);
+                // al restaurar, solo el objetivo para no resucitar omisiones ajenas
+                if dismissing {
+                    let refs: Vec<Misspelling> = targets.iter().filter_map(|j| s.all_errs.get(*j).cloned()).collect();
+                    for e in s.all_errs.iter_mut() {
+                        if !e.dismissed && refs.iter().any(|r| boxes_overlap(r, e)) {
+                            e.dismissed = true;
+                        }
+                    }
+                }
+                // si el flash quedó sobre algo omitido, se limpia (era wash amarillo fantasma)
+                if let Some((fi, _)) = s.flash {
+                    if s.all_errs.get(fi).map(|e| e.dismissed).unwrap_or(false) {
+                        s.flash = None;
+                    }
+                }
+                s.page
             };
             push_errs(&ui, &st);
             show(&ui, &mut st.borrow_mut(), pg); // refresca subrayados
@@ -680,14 +1075,22 @@ fn main() -> anyhow::Result<()> {
         let st = st.clone();
         ui.on_save_note(move |i| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let gi = match st.borrow().view.get(i as usize) {
-                Some(g) => *g,
-                None => return,
-            };
             let text = ui.get_note_text().to_string();
-            match annotate(&st.borrow(), gi, &text) {
-                Ok(out) => ui.set_status(format!("Nota guardada en {} (reabre ese archivo para verla)", out.display()).into()),
-                Err(e) => ui.set_status(format!("Error al anotar: {e:#}").into()),
+            let group = st.borrow().view_group.get(i as usize).cloned().flatten();
+            let res = if let Some(w) = group {
+                let idxs: Vec<usize> = st.borrow().all_errs.iter().enumerate()
+                    .filter(|(_, e)| e.word == w).map(|(gi, _)| gi).collect();
+                annotate_many(&st.borrow(), &idxs, &text)
+            } else {
+                let gi = match st.borrow().view.get(i as usize) {
+                    Some(g) => *g,
+                    None => return,
+                };
+                annotate(&st.borrow(), gi, &text)
+            };
+            match res {
+                Ok(out) => notify(&ui, &st, format!("Nota guardada en {} (reabre ese archivo para verla)", out.display())),
+                Err(e) => notify(&ui, &st, format!("Error al anotar: {e:#}")),
             }
             ui.set_selected_note(-1);
         });
@@ -695,9 +1098,85 @@ fn main() -> anyhow::Result<()> {
     {
         let ui_weak = ui.as_weak();
         let st = st.clone();
-        ui.on_filter_set(move |f| {
+        ui.on_grammar_clicked(move |i| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let (word, sug, group) = {
+                let s = st.borrow();
+                let gi = match s.view.get(i as usize) {
+                    Some(g) => *g,
+                    None => return,
+                };
+                let e = match s.all_errs.get(gi) {
+                    Some(e) => e,
+                    None => return,
+                };
+                (e.word.clone(), e.sug.clone(), s.view_group.get(i as usize).cloned().flatten())
+            };
+            let en = ui.get_lang_idx() == 2;
+            let sugs = if sug.is_empty() { if en { "no suggestions".into() } else { "sin sugerencias".into() } } else { sug.join(", ") };
+            let text = if en {
+                format!("Grammar observation: '{word}' -> {sugs}")
+            } else {
+                format!("Observación de error gramatical: '{word}' -> {sugs}")
+            };
+            let res = if let Some(w) = group {
+                let idxs: Vec<usize> = st.borrow().all_errs.iter().enumerate()
+                    .filter(|(_, e)| e.word == w).map(|(gi, _)| gi).collect();
+                annotate_many(&st.borrow(), &idxs, &text)
+            } else {
+                let gi = match st.borrow().view.get(i as usize) {
+                    Some(g) => *g,
+                    None => return,
+                };
+                annotate(&st.borrow(), gi, &text)
+            };
+            match res {
+                Ok(out) => notify(&ui, &st, format!("Observación guardada en {} (reabre ese archivo para verla)", out.display())),
+                Err(e) => notify(&ui, &st, format!("Error al anotar: {e:#}")),
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_group_toggle(move |i| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let word = {
+                let s = st.borrow();
+                if let Some(Some(w)) = s.view_group.get(i as usize).cloned() {
+                    Some(w) // colapsado -> expandir
+                } else {
+                    let gi = match s.view.get(i as usize) {
+                        Some(g) => *g,
+                        None => return,
+                    };
+                    s.all_errs.get(gi).map(|e| e.word.clone()) // individual -> colapsar
+                }
+            };
+            if let Some(w) = word {
+                let mut s = st.borrow_mut();
+                if s.expanded.contains(&w) { s.expanded.remove(&w); } else { s.expanded.insert(w); }
+            }
+            ui.set_selected_note(-1);
+            push_errs(&ui, &st);
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_type_set(move |f| {
             if let Some(ui) = ui_weak.upgrade() {
-                ui.set_err_filter(f);
+                ui.set_type_filter(f);
+                push_errs(&ui, &st);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_sev_set(move |f| {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_sev_filter(f);
                 push_errs(&ui, &st);
             }
         });
@@ -711,15 +1190,58 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // ponytail: parsear .dic/.aff tarda segundos en debug; se adelanta mientras el usuario elige archivo
-    std::thread::spawn({
+    // sidecar LanguageTool: reutiliza uno externo o levanta hijo java propio.
+    // ponytail: el Child viaja por el canal al hilo UI; los hilos de página solo hacen HTTP
+    {
         let tx = st.borrow().tx.clone();
-        move || {
-            let _ = dict_cached("es_ES");
-            let _ = dict_cached("en_US");
-            let _ = tx.send(SpellEvent::DictsReady);
-        }
-    });
+        std::thread::spawn(move || {
+            if lt_alive() {
+                let _ = tx.send(SpellEvent::LtReady(None));
+                return;
+            }
+            let Some(dir) = lt_dir() else {
+                let _ = tx.send(SpellEvent::LtFail("no se encontró assets/lt (¿falló la descarga en build?)".into()));
+                return;
+            };
+            let jar = dir.join("languagetool-server.jar");
+            let child = std::process::Command::new("java")
+                .args(["-Xms256m", "-Xmx1g", "-Dfile.encoding=UTF-8", "-cp"])
+                .arg(&jar)
+                .arg("org.languagetool.server.HTTPServer")
+                .args(["--port", &LT_PORT.to_string()])
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            let mut child = match child {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = tx.send(SpellEvent::LtFail("java no encontrado (se necesita Java 17+)".into()));
+                    return;
+                }
+            };
+            // espera hasta 90s a que caliente reglas
+            let mut ok = false;
+            for _ in 0..45 {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if lt_alive() {
+                    ok = true;
+                    break;
+                }
+                // si el hijo murió, no tiene sentido seguir esperando
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    _ => {}
+                }
+            }
+            if ok {
+                let _ = tx.send(SpellEvent::LtReady(Some(child)));
+            } else {
+                let _ = child.kill();
+                let _ = tx.send(SpellEvent::LtFail("el servidor LT no respondió a tiempo".into()));
+            }
+        });
+    }
 
     // ponytail: abrir por argv evita el diálogo para pruebas/demos; quitar si molesta
     if let Some(arg) = std::env::args().nth(1) {
@@ -732,6 +1254,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     ui.run()?;
+    // apaga el sidecar propio (si se reutilizó uno externo, no se toca)
+    if let Some(mut c) = st.borrow_mut().lt_child.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
     Ok(())
 }
 
@@ -746,19 +1273,83 @@ mod tests {
         assert!((y - 1600.0).abs() < 0.01 && (h - 200.0).abs() < 0.01);
     }
     #[test]
-    fn kinds() {
-        assert_eq!(kind_of("herror"), "Error");
-        assert_eq!(kind_of("Madrid"), "Mayúscula");
-        assert_eq!(kind_of("ADSL"), "Sigla");
-        assert_eq!(kind_of("a"), "Error");
+    fn sev() {
+        assert_eq!(kind_of_lt("TYPOS"), "Ortografía");
+        assert_eq!(kind_of_lt("GRAMMAR"), "Sintaxis");
+        assert_eq!(sev_of_lt("TYPOS"), "intermedia");
+        assert_eq!(sev_of_lt("GRAMMAR"), "grave");
+        assert_eq!(sev_of_lt("PUNCTUATION"), "intermedia");
+        assert_eq!(sev_of_lt("STYLE"), "mínima");
+        assert_eq!(sev_of_lt(""), "mínima");
+        assert_eq!(worst_sev(["mínima", "grave", "intermedia"].into_iter()), "grave");
+        assert_eq!(worst_sev(["mínima"].into_iter()), "mínima");
+    }
+    #[test]
+    fn order() {
+        let m = |page, x0, y1| Misspelling { word: "x".into(), sug: vec![], page, x0, y0: 0.0, x1: x0 + 5.0, y1, dismissed: false, kind: "Ortografía".into(), sev: "intermedia".into() };
+        let mut v = vec![m(1, 0.0, 10.0), m(0, 50.0, 100.0), m(0, 10.0, 100.0), m(0, 10.0, 50.0)];
+        v.sort_by(err_order);
+        assert_eq!(v.iter().map(|e| (e.page, e.x0, e.y1)).collect::<Vec<_>>(),
+            vec![(0, 10.0, 100.0), (0, 50.0, 100.0), (0, 10.0, 50.0), (1, 0.0, 10.0)]);
+    }
+    #[test]
+    fn overlap() {
+        let m = |page, x0, x1| Misspelling { word: "x".into(), sug: vec![], page, x0, y0: 0.0, x1, y1: 5.0, dismissed: false, kind: "Ortografía".into(), sev: "intermedia".into() };
+        assert!(boxes_overlap(&m(0, 0.0, 10.0), &m(0, 5.0, 15.0)));
+        assert!(!boxes_overlap(&m(0, 0.0, 10.0), &m(0, 10.0, 20.0)));
+        assert!(!boxes_overlap(&m(0, 0.0, 10.0), &m(1, 0.0, 10.0)));
+    }
+    #[test]
+    fn span_mapping() {
+        let ws = vec![
+            Word { text: "She".into(), x0: 0.0, y0: 0.0, x1: 10.0, y1: 5.0 },
+            Word { text: "was".into(), x0: 11.0, y0: 0.0, x1: 20.0, y1: 5.0 },
+            Word { text: "not".into(), x0: 21.0, y0: 0.0, x1: 30.0, y1: 5.0 },
+        ];
+        let (t, r) = join_words(&ws);
+        assert_eq!(t, "She was not");
+        assert_eq!(r.len(), 3);
+        let b = span_to_box(&ws, &r, 4, 11).unwrap(); // "was not" parcial
+        assert_eq!(b.4, "was not");
+        assert!((b.0 - 11.0).abs() < 0.01 && (b.2 - 30.0).abs() < 0.01);
+        assert!(span_to_box(&ws, &r, 50, 60).is_none());
+    }
+    #[test]
+    fn lt_parse_and_map() {
+        // respuesta /v2/check enlatada (offsets en chars): sin servidor
+        let body = r#"{"matches":[
+            {"offset":22,"length":6,"replacements":[{"value":"que"}]},
+            {"offset":0,"length":0,"replacements":[{"value":"x"}]},
+            {"offset":5,"length":3,"replacements":[]}
+        ]}"#;
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        let ms = v["matches"].as_array().unwrap();
+        assert_eq!(ms.len(), 3);
+        // el filtro real (lt_check) descartaría length 0 y sin reemplazos;
+        // aquí se verifica el mapeo chars->box con ñ multibyte
+        let ws = vec![
+            Word { text: "El".into(), x0: 0.0, y0: 0.0, x1: 5.0, y1: 5.0 },
+            Word { text: "niño".into(), x0: 6.0, y0: 0.0, x1: 15.0, y1: 5.0 },
+            Word { text: "juega".into(), x0: 16.0, y0: 0.0, x1: 25.0, y1: 5.0 },
+        ];
+        let (t, r) = join_words(&ws);
+        assert_eq!(t, "El niño juega");
+        assert_eq!(r[1], 3..7); // chars, no bytes (niño = 4 chars)
+        let b = span_to_box(&ws, &r, 3, 7).unwrap();
+        assert_eq!(b.4, "niño");
     }
     #[test]
     fn underline_paints_red() {
         let mut img = image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 255, 255, 255]));
-        underline(&mut img, 1.0, 1.0, 5.0);
+        underline(&mut img, 1.0, 1.0, 5.0, (211, 47, 47));
         let p = img.get_pixel(2, 2);
         assert!(p[0] > 200 && p[1] < 150 && p[2] < 150);
         assert_eq!(img.get_pixel(0, 0), &image::Rgba([255, 255, 255, 255]));
+        let mut img = image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 255, 255, 255]));
+        underline(&mut img, 1.0, 1.0, 5.0, under_color("Sintaxis"));
+        let p = img.get_pixel(2, 2);
+        assert!(p[2] > p[0]); // morado, no rojo
+        assert_eq!(under_color("Ortografía"), (211, 47, 47));
     }
     #[test]
     fn annotate_creates_sibling_file() {
@@ -769,8 +1360,8 @@ mod tests {
         let st = State {
             pdfium: load_pdfium(), path: Some(src), page: 0, total: 3,
             words: vec![], page_w: 0.0, page_h: 0.0, img_w: 0, img_h: 0,
-            all_errs: vec![Misspelling { word: "herror".into(), sug: vec!["error".into()], page: 0, x0: 72.0, y0: 700.0, x1: 130.0, y1: 712.0, dismissed: false, kind: "Error".into() }],
-            scan_id: 0, scan_queue: vec![], scan_pos: 0, dicts_ready: true, tx, last_lang: 0, flash: None, view: vec![],
+            all_errs: vec![Misspelling { word: "herror".into(), sug: vec!["error".into()], page: 0, x0: 72.0, y0: 700.0, x1: 130.0, y1: 712.0, dismissed: false, kind: "Ortografía".into(), sev: "intermedio".into() }],
+            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 1.0, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, lt_child: None,
         };
         let out = annotate(&st, 0, "nota de prueba").unwrap();
         assert_eq!(out.file_name().unwrap(), "doc3_anotado.pdf");
