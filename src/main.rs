@@ -133,6 +133,24 @@ type SpellMsg = SpellEvent;
 
 const LT_PORT: u16 = 8081;
 
+/// Qué `java` usar: $JAVA_BIN → `jre\bin\java.exe` junto al exe (instalador
+/// Windows) → `java` del PATH. Devuelve el comando listo para Command.
+fn java_cmd() -> std::process::Command {
+    if let Ok(j) = std::env::var("JAVA_BIN") {
+        return std::process::Command::new(j);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            for c in [d.join("jre/bin/java"), d.join("jre/bin/java.exe")] {
+                if c.is_file() {
+                    return std::process::Command::new(c);
+                }
+            }
+        }
+    }
+    std::process::Command::new("java")
+}
+
 /// Dónde vive LanguageTool desempaquetado: $LT_HOME → junto al exe → assets/lt.
 fn lt_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("LT_HOME") {
@@ -1453,7 +1471,8 @@ fn main() -> anyhow::Result<()> {
                 return;
             };
             let jar = dir.join("languagetool-server.jar");
-            let child = std::process::Command::new("java")
+            let mut cmd = java_cmd();
+            let child = cmd
                 .args(["-Xms256m", "-Xmx1g", "-Dfile.encoding=UTF-8", "-cp"])
                 .arg(&jar)
                 .arg("org.languagetool.server.HTTPServer")

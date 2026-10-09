@@ -122,3 +122,5 @@ ortografía, morado sintaxis), zoom ×1.25 (0.5–3.0) + nota libre con botón `
  gitignoreado —requiere red en build y Java 17+ en runtime—; medido: arranque
 -`~4s, ~80ms/check, ~650MB RAM). `cargo test` rápido (sin motores pesados en tests).
 Licencia proyecto: MIT. Pdfium: BSD + third-party en `assets/pdfium/licenses/`.
+Windows: `installer/windows/` (Inno + `stage.ps1` + CI con SignPath opt-in);
+java en `$JAVA_BIN` → `jre\` junto al exe → `PATH`.

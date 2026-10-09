@@ -1,0 +1,55 @@
+name: windows
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release
+        env:
+          # build.rs descarga LT ~240MB aquí (cacheado entre runs si se configura cachix)
+          CARGO_NET_RETRY: '10'
+
+      - name: Stage dist
+        shell: pwsh
+        run: ./installer/windows/stage.ps1
+
+      - name: Compila instalador (Inno)
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.2
+        with:
+          path: installer/windows/pdf-corrector.iss
+
+      - name: Sube instalador
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: dist/pdf-corrector-setup.exe
+
+      # Firma con SignPath (gratis para OSS). Activar cuando exista cuenta:
+      # 1. signpath.io → cuenta + proyecto 'pdf-corrector' + repo vinculado
+      # 2. Secrets: SIGNPATH_API_TOKEN, SIGNPATH_ORG_ID
+      # 3. Descomentar el paso y ajustar slugs/artifacts según el dashboard.
+      # - name: Firma con SignPath
+      #   uses: signpath/github-action@v1
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+      #     project-slug: 'pdf-corrector'
+      #     signing-policy-slug: 'release-signing'
+      #     github-artifact-id: 'installer'
+      #     output-artifact-directory: 'dist/signed'
+
+      - name: Release en tags v*
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/pdf-corrector-setup.exe
