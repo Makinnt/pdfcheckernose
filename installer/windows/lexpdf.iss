@@ -39,7 +39,7 @@ Source: "{#StageDir}\lexpdf.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\pdfium.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\lt\*"; DestDir: "{app}\lt"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; JRE empaquetado (opcional: si no está, el instalador pedirá Java, ver [Code])
-Source: "{#StageDir}\jre\*"; DestDir: "{app}\jre"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Check: DirExists(ExpandConstant('{#StageDir}\jre'))
+Source: "{#StageDir}\jre\*"; DestDir: "{app}\jre"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\lexpdf.exe"
@@ -56,7 +56,7 @@ function JavaSistema(): Boolean;
 var
   Codigo: Integer;
 begin
-  { Solo Java del sistema: aquí {app} aún no existe, no usarlo. }
+  // Solo Java del sistema: aqui APP aún no existe, no usarlo.
   Result := Exec('java.exe', '-version', '', SW_HIDE, ewWaitUntilTerminated, Codigo)
     and (Codigo = 0);
 end;
@@ -80,7 +80,7 @@ var
   Bundled, Msg: String;
   Codigo: Integer;
 begin
-  { Verificación post-instalación (aquí {app} ya existe). }
+  // Verificación post-instalación (aqui APP ya existe).
   if CurStep <> ssPostInstall then
     Exit;
   Bundled := ExpandConstant('{app}\jre\bin\java.exe');
