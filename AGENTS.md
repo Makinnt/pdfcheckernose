@@ -113,9 +113,12 @@ Tipo+Gravedad —inline, sin std-widgets—, omitir en cascada por solape de box
 ortografía, morado sintaxis), zoom ×1.25 (0.5–3.0) + nota libre con botón `✎ Nota`
 (panel sobre la página visible → `annotate_at`), notas acumulativas sobre
 `_anotado.pdf` (guardado vía temporal+rename — Pdfium mapea el archivo), sidecar java hijo —reutiliza externo
-en :8081—, `LtReady/LtFail/Syn(gen)` con `scan_id`, hilos de página solo HTTP
-con palabras clonadas —nunca Pdfium en hilos—, offsets en chars → box unión
-vía `join_words`/`span_to_box`; `build.rs` descarga LT ~240MB a `assets/lt/`
-gitignoreado —requiere red en build y Java 17+ en runtime—; medido: arranque
-~4s, ~80ms/check, ~650MB RAM). `cargo test` rápido (sin motores pesados en tests).
+ en :8081—, `LtReady/LtFail/Syn(gen)` con `scan_id`, hilos de página solo HTTP
+ con palabras clonadas —nunca Pdfium en hilos—, offsets en chars → box unión
+ vía `join_words`/`span_to_box`; notas existentes leídas (`read_notes` →
+ marcadores ámbar + sección Notas → salto centrado); historial 10 últimos en
+ `~/.config/pdf-corrector/history.json` (errores/omitidos/notas + % revisado,
+ sección Recientes → `open_doc`); `build.rs` descarga LT ~240MB a `assets/lt/`
+ gitignoreado —requiere red en build y Java 17+ en runtime—; medido: arranque
+-`~4s, ~80ms/check, ~650MB RAM). `cargo test` rápido (sin motores pesados en tests).
 Licencia proyecto: MIT. Pdfium: BSD + third-party en `assets/pdfium/licenses/`.
