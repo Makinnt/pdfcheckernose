@@ -36,6 +36,7 @@ struct State {
     img_w: u32,
     img_h: u32,
     all_errs: Vec<Misspelling>, // hallazgos de todo el doc (LT: ortografía + sintaxis)
+    doc_notes: Vec<DocNote>, // notas nativas ya existentes en el PDF
     view: Vec<usize>, // índices a all_errs tras aplicar los filtros
     view_group: Vec<Option<String>>, // paralela a view: Some(word) si la fila es grupo colapsado
     expanded: HashSet<String>, // palabras desagrupadas por el usuario (grupo 5+)
@@ -51,6 +52,16 @@ struct State {
     lt_child: Option<std::process::Child>, // hijo java propio (None si se reutiliza uno externo)
     tx: Sender<SpellMsg>,
     last_lang: i32,
+}
+
+#[derive(Clone, Debug)]
+struct DocNote {
+    page: u32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    text: String,
 }
 
 #[derive(Clone, Debug)]
@@ -595,6 +606,161 @@ fn annotate_base(st: &State) -> anyhow::Result<(PdfDocument, PathBuf)> {
     Ok((doc, out))
 }
 
+/// Lee las sticky-notes (Text) ya existentes en el documento.
+/// Puro dato (sin lifetimes Pdfium): tolera anotaciones sin texto o sin box.
+fn read_notes(pdfium: &Pdfium, path: &PathBuf) -> Vec<DocNote> {
+    let mut out = vec![];
+    let Ok(doc) = pdfium.load_pdf_from_file(path, None) else { return out };
+    let pages = doc.pages();
+    for i in 0..pages.len() {
+        let Ok(pg) = pages.get(i) else { continue };
+        for ann in pg.annotations().iter() {
+            if ann.annotation_type() != PdfPageAnnotationType::Text {
+                continue;
+            }
+            let Some(text) = ann.contents() else { continue };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let (x0, y0, x1, y1) = match ann.bounds() {
+                Ok(b) => (b.left().value, b.bottom().value, b.right().value, b.top().value),
+                Err(_) => continue,
+            };
+            out.push(DocNote { page: i as u32, x0, y0, x1, y1, text });
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct HisEntry {
+    path: String,
+    pages: u32,
+    errors: usize,
+    resolved: usize, // omitidos
+    notes: usize,    // notas nativas en el PDF
+    mtime: i64,
+}
+
+/// `~/.config/pdf-corrector/history.json` (10 últimos).
+fn history_file() -> Option<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(PathBuf::from(home).join(".config/pdf-corrector/history.json"))
+}
+
+fn load_history() -> Vec<HisEntry> {
+    let Some(f) = history_file() else { return vec![] };
+    let Ok(b) = std::fs::read_to_string(&f) else { return vec![] };
+    let mut v: Vec<HisEntry> = serde_json::from_str(&b).unwrap_or_default();
+    v.retain(|e| PathBuf::from(&e.path).is_file());
+    v.truncate(10);
+    v
+}
+
+/// Guarda la foto de progreso del documento actual al frente (máx 10).
+fn touch_history(st: &State) {
+    let Some(f) = history_file() else { return };
+    let Some(path) = st.path.clone() else { return };
+    let mut v: Vec<HisEntry> = std::fs::read_to_string(&f)
+        .ok()
+        .and_then(|b| serde_json::from_str(&b).ok())
+        .unwrap_or_default();
+    v.retain(|e| e.path != path.to_string_lossy());
+    v.insert(0, HisEntry {
+        path: path.to_string_lossy().into_owned(),
+        pages: st.total,
+        errors: st.all_errs.len(),
+        resolved: st.all_errs.iter().filter(|e| e.dismissed).count(),
+        notes: st.doc_notes.len(),
+        mtime: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    });
+    v.truncate(10);
+    if let Some(dir) = f.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&f, serde_json::to_string(&v).unwrap_or_default());
+}
+
+fn push_history(ui: &AppWindow) {
+    let rows: Vec<HisRow> = load_history()
+        .iter()
+        .map(|e| {
+            let name = PathBuf::from(&e.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .into();
+            let pct = if e.errors == 0 { 100 } else { e.resolved * 100 / e.errors };
+            HisRow {
+                name,
+                info: format!("{} págs · {} errores · {} notas · {}%", e.pages, e.errors, e.notes, pct).into(),
+            }
+        })
+        .collect();
+    ui.set_history(ModelRc::new(VecModel::from_slice(&rows)));
+}
+
+/// Abre un documento por ruta (diálogo, argv o historial): misma tubería.
+fn open_doc(ui: &AppWindow, st: &Rc<RefCell<State>>, path: PathBuf) {
+    let notes = read_notes(&st.borrow().pdfium, &path);
+    st.borrow_mut().path = Some(path);
+    st.borrow_mut().doc_notes = notes;
+    push_notes(ui, st);
+    show(ui, &mut st.borrow_mut(), 0);
+    start_scan(ui, &mut st.borrow_mut());
+    touch_history(&st.borrow());
+    push_history(ui);
+}
+
+/// Relee las notas del PDF tras anotar (acumulan) y actualiza lista + historial.
+fn refresh_notes(ui: &AppWindow, st: &Rc<RefCell<State>>) {
+    let path = st.borrow().path.clone();
+    if let Some(p) = path {
+        let notes = read_notes(&st.borrow().pdfium, &p);
+        st.borrow_mut().doc_notes = notes;
+    }
+    push_notes(ui, st);
+    touch_history(&st.borrow());
+    push_history(ui);
+    let pg = st.borrow().page;
+    show(ui, &mut st.borrow_mut(), pg); // repinta marcadores
+}
+
+fn push_notes(ui: &AppWindow, st: &Rc<RefCell<State>>) {    let rows: Vec<NoteRow> = st
+        .borrow()
+        .doc_notes
+        .iter()
+        .map(|n| {
+            let mut t: String = n.text.chars().take(80).collect();
+            if n.text.chars().count() > 80 {
+                t.push('…');
+            }
+            NoteRow { text: t.into(), page: n.page as i32 }
+        })
+        .collect();
+    ui.set_notes(ModelRc::new(VecModel::from_slice(&rows)));
+}
+fn marker(img: &mut image::RgbaImage, x: f32, y: f32) {
+    let (iw, ih) = (img.width() as i64, img.height() as i64);
+    for dx in 0..8i64 {
+        for dy in 0..8i64 {
+            let (px, py) = (x.round() as i64 + dx, y.round() as i64 + dy);
+            if px < 0 || py < 0 || px >= iw || py >= ih {
+                continue;
+            }
+            let p = img.get_pixel_mut(px as u32, py as u32);
+            p[0] = 255;
+            p[1] = 179;
+            p[2] = 0;
+        }
+    }
+}
+
 /// Inyecta una nota nativa (sticky-note) en el box del error y guarda
 /// en `{nombre}_anotado.pdf`. Nunca sobreescribe el original.
 fn annotate(st: &State, idx: usize, text: &str) -> anyhow::Result<PathBuf> {
@@ -663,6 +829,10 @@ fn show(ui: &AppWindow, st: &mut State, page: u32) {
         for h in st.all_errs.iter().filter(|e| e.page == page && !e.dismissed) {
             let (x, y, w, hh) = pdf_to_image(h.x0, h.y0, h.x1, h.y1, pw, ph, iw, ih);
             underline(&mut rgba, x, y + hh - 3.0, w, under_color(&h.kind));
+        }
+        for n in st.doc_notes.iter().filter(|n| n.page == page) {
+            let (x, y, _, _) = pdf_to_image(n.x0, n.y0, n.x1, n.y1, pw, ph, iw, ih);
+            marker(&mut rgba, x, y);
         }
         // flash amarillo 5s del error clicado
         if let Some((fi, t)) = &st.flash {
@@ -752,6 +922,7 @@ fn main() -> anyhow::Result<()> {
         img_w: 0,
         img_h: 0,
         all_errs: vec![],
+        doc_notes: vec![],
         view: vec![],
         view_group: vec![],
         expanded: HashSet::new(),
@@ -842,9 +1013,7 @@ fn main() -> anyhow::Result<()> {
                 return;
             };
             ui.set_status("Cargando…".into());
-            st.borrow_mut().path = Some(file);
-            show(&ui, &mut st.borrow_mut(), 0);
-            start_scan(&ui, &mut st.borrow_mut());
+            open_doc(&ui, &st, file);
         });
     }
     {
@@ -946,7 +1115,10 @@ fn main() -> anyhow::Result<()> {
                 None => Err(anyhow::anyhow!("toca primero el punto del PDF")),
             };
             match res {
-                Ok(out) => notify(&ui, &st, format!("Nota guardada en {} (reabre ese archivo para verla)", out.display())),
+                Ok(out) => {
+                    notify(&ui, &st, format!("Nota guardada en {} (reabre ese archivo para verla)", out.display()));
+                    refresh_notes(&ui, &st);
+                }
                 Err(e) => notify(&ui, &st, format!("Error al anotar: {e:#}")),
             }
             ui.set_free_note_on(false);
@@ -1075,6 +1247,8 @@ fn main() -> anyhow::Result<()> {
             };
             push_errs(&ui, &st);
             show(&ui, &mut st.borrow_mut(), pg); // refresca subrayados
+            touch_history(&st.borrow());
+            push_history(&ui);
         });
     }
     {
@@ -1105,7 +1279,10 @@ fn main() -> anyhow::Result<()> {
                 annotate(&st.borrow(), gi, &text)
             };
             match res {
-                Ok(out) => notify(&ui, &st, format!("Nota guardada en {} (reabre ese archivo para verla)", out.display())),
+                Ok(out) => {
+                    notify(&ui, &st, format!("Nota guardada en {} (reabre ese archivo para verla)", out.display()));
+                    refresh_notes(&ui, &st);
+                }
                 Err(e) => notify(&ui, &st, format!("Error al anotar: {e:#}")),
             }
             ui.set_selected_note(-1);
@@ -1147,7 +1324,10 @@ fn main() -> anyhow::Result<()> {
                 annotate(&st.borrow(), gi, &text)
             };
             match res {
-                Ok(out) => notify(&ui, &st, format!("Observación guardada en {} (reabre ese archivo para verla)", out.display())),
+                Ok(out) => {
+                    notify(&ui, &st, format!("Observación guardada en {} (reabre ese archivo para verla)", out.display()));
+                    refresh_notes(&ui, &st);
+                }
                 Err(e) => notify(&ui, &st, format!("Error al anotar: {e:#}")),
             }
         });
@@ -1175,6 +1355,42 @@ fn main() -> anyhow::Result<()> {
             }
             ui.set_selected_note(-1);
             push_errs(&ui, &st);
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_docnote_clicked(move |i| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let n = match st.borrow().doc_notes.get(i as usize).cloned() {
+                Some(n) => n,
+                None => return,
+            };
+            if n.page != st.borrow().page {
+                show(&ui, &mut st.borrow_mut(), n.page);
+            }
+            // centra como un error cualquiera
+            let s = st.borrow();
+            if s.img_w > 0 && s.img_h > 0 {
+                let (x, y, w, h) = pdf_to_image(n.x0, n.y0, n.x1, n.y1, s.page_w, s.page_h, s.img_w, s.img_h);
+                let (vw, vh) = (ui.get_view_w(), ui.get_view_h());
+                ui.set_view_x(-((x + w / 2.0 - vw / 2.0).clamp(0.0, (s.img_w as f32 - vw).max(0.0))));
+                ui.set_view_y(-((y + h / 2.0 - vh / 2.0).clamp(0.0, (s.img_h as f32 - vh).max(0.0))));
+            }
+            drop(s);
+            notify(&ui, &st, format!("pág {}: {}", n.page + 1, n.text.chars().take(120).collect::<String>()));
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_history_open(move |i| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let path = load_history().get(i as usize).map(|e| PathBuf::from(&e.path));
+            match path {
+                Some(p) if p.is_file() => open_doc(&ui, &st, p),
+                _ => notify(&ui, &st, "Ese archivo ya no existe.".into()),
+            }
         });
     }
     {
@@ -1263,11 +1479,10 @@ fn main() -> anyhow::Result<()> {
     if let Some(arg) = std::env::args().nth(1) {
         let p = PathBuf::from(&arg);
         if p.is_file() {
-            st.borrow_mut().path = Some(p);
-            show(&ui, &mut st.borrow_mut(), 0);
-            start_scan(&ui, &mut st.borrow_mut());
+            open_doc(&ui, &st, p);
         }
     }
+    push_history(&ui);
 
     ui.run()?;
     // apaga el sidecar propio (si se reutilizó uno externo, no se toca)
@@ -1368,6 +1583,23 @@ mod tests {
         assert_eq!(under_color("Ortografía"), (211, 47, 47));
     }
     #[test]
+    fn notes_roundtrip() {
+        let src = PathBuf::from("/tmp/doc3.pdf");
+        assert!(src.is_file(), "falta /tmp/doc3.pdf de prueba");
+        let (tx, _rx) = channel::<SpellMsg>();
+        let st = State {
+            pdfium: load_pdfium(), path: Some(src.clone()), page: 0, total: 3,
+            words: vec![], page_w: 0.0, page_h: 0.0, img_w: 0, img_h: 0,
+            all_errs: vec![Misspelling { word: "herror".into(), sug: vec!["error".into()], page: 0, x0: 72.0, y0: 700.0, x1: 130.0, y1: 712.0, dismissed: false, kind: "Ortografía".into(), sev: "intermedia".into() }],
+            doc_notes: vec![],
+            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 0.5, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, lt_child: None,
+        };
+        annotate(&st, 0, "nota redonda").unwrap();
+        let out = src.with_file_name("doc3_anotado.pdf");
+        let notes = read_notes(&st.pdfium, &out);
+        assert!(notes.iter().any(|n| n.text.contains("nota redonda") && n.page == 0));
+    }
+    #[test]
     fn annotate_creates_sibling_file() {
         // ponytail: usa /tmp/doc3.pdf generado en dev; si falta, el test falla explícito
         let src = PathBuf::from("/tmp/doc3.pdf");
@@ -1377,6 +1609,7 @@ mod tests {
             pdfium: load_pdfium(), path: Some(src), page: 0, total: 3,
             words: vec![], page_w: 0.0, page_h: 0.0, img_w: 0, img_h: 0,
             all_errs: vec![Misspelling { word: "herror".into(), sug: vec!["error".into()], page: 0, x0: 72.0, y0: 700.0, x1: 130.0, y1: 712.0, dismissed: false, kind: "Ortografía".into(), sev: "intermedio".into() }],
+            doc_notes: vec![],
             scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 1.0, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, lt_child: None,
         };
         let out = annotate(&st, 0, "nota de prueba").unwrap();

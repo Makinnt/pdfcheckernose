@@ -3816,6 +3816,7 @@ dependencies = [
  "image",
  "pdfium-render",
  "rfd",
+ "serde",
  "serde_json",
  "slint",
  "slint-build",

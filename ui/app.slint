@@ -11,6 +11,16 @@ struct ErrRow {
     is_group: bool,
 }
 
+struct NoteRow {
+    text: string,
+    page: int,
+}
+
+struct HisRow {
+    name: string,
+    info: string,
+}
+
 component MiniBtn inherits Rectangle {
     in property <string> label;
     in property <color> bg: #eee;
@@ -85,6 +95,8 @@ export component AppWindow inherits Window {
     in-out property <int> word-count: 0;
     in-out property <string> word-sample: "";
     in-out property <[ErrRow]> errors;
+    in-out property <[NoteRow]> notes;
+    in-out property <[HisRow]> history;
     in-out property <string> spell-status: "";
     in-out property <bool> is-dark: false;
     in-out property <bool> scanning: false;
@@ -117,6 +129,8 @@ export component AppWindow inherits Window {
     callback type-set(int);
     callback sev-set(int);
     callback popup-dismiss();
+    callback docnote-clicked(int);
+    callback history-open(int);
     callback zoom-in();
     callback zoom-out();
     callback zoom-text(string);
@@ -196,6 +210,27 @@ export component AppWindow inherits Window {
                     }
                 }
                 Text { text <=> root.status; font-size: 13px; color: root.c-dim; wrap: word-wrap; }
+
+                if (root.history.length > 0): VerticalLayout {
+                    spacing: 4px;
+                    Text { text: "Recientes"; font-size: 14px; font-weight: 700; color: root.c-fg; }
+                    VerticalLayout {
+                        spacing: 2px;
+                        for h[i] in root.history: Rectangle {
+                            height: 30px;
+                            background: root.c-pill; border-radius: 4px;
+                            HorizontalLayout {
+                                padding-left: 8px; padding-right: 8px; spacing: 6px;
+                                Text {
+                                    text: h.name; color: root.c-fg; font-size: 12px; font-weight: 700;
+                                    horizontal-stretch: 1; vertical-alignment: center; overflow: elide;
+                                }
+                                Text { text: h.info; color: root.c-dim; font-size: 11px; vertical-alignment: center; }
+                            }
+                            TouchArea { width: parent.width; height: parent.height; clicked => { root.history-open(i); } }
+                        }
+                    }
+                }
 
                 Rectangle { height: 1px; background: root.c-line; }
 
@@ -331,6 +366,24 @@ export component AppWindow inherits Window {
                     font-size: 13px; color: root.c-dim; wrap: word-wrap;
                     horizontal-alignment: center;
                     visible: !root.has-doc;
+                }
+                if (root.notes.length > 0): VerticalLayout {
+                    spacing: 4px;
+                    Text { text: "Notas en el PDF (" + root.notes.length + ")"; font-size: 14px; font-weight: 700; color: root.c-fg; }
+                    VerticalLayout {
+                        spacing: 2px;
+                        for n[i] in root.notes: Rectangle {
+                            background: root.c-card;
+                            border-color: root.c-line; border-width: 1px; border-radius: 6px;
+                            VerticalLayout {
+                                padding: 6px; spacing: 2px;
+                                horizontal-stretch: 1;
+                                Text { text: n.text; font-size: 12px; color: root.c-fg; wrap: word-wrap; max-height: 34px; overflow: elide; }
+                                Text { text: "pág " + (n.page + 1); font-size: 11px; color: root.c-dim; }
+                            }
+                            TouchArea { width: parent.width; height: parent.height; clicked => { root.docnote-clicked(i); } }
+                        }
+                    }
                 }
             }
         }
