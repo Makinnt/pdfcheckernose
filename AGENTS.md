@@ -110,8 +110,8 @@ Fase 5 (revisión 100% LT: `kind`=Ortografía|Sintaxis + `sev` mínima|intermedi
 (categoría LT; TYPOS=ortografía), 2 desplegables propios `DropSel`
 Tipo+Gravedad —inline, sin std-widgets—, omitir en cascada por solape de boxes
 + limpieza de flash, barra única vía `refresh_progress`, subrayado por clase (rojo
-ortografía, morado sintaxis), zoom ×1.25 (0.5–3.0) + nota libre por clic en el visor
-(`Flickable` 1:1, `page-clicked` → `annotate_at`), notas acumulativas sobre
+ortografía, morado sintaxis), zoom ×1.25 (0.5–3.0) + nota libre con botón `✎ Nota`
+(panel sobre la página visible → `annotate_at`), notas acumulativas sobre
 `_anotado.pdf` (guardado vía temporal+rename — Pdfium mapea el archivo), sidecar java hijo —reutiliza externo
 en :8081—, `LtReady/LtFail/Syn(gen)` con `scan_id`, hilos de página solo HTTP
 con palabras clonadas —nunca Pdfium en hilos—, offsets en chars → box unión
