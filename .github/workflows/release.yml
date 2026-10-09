@@ -1,8 +1,8 @@
 name: release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -68,11 +68,11 @@ jobs:
           name: LexPDF-linux
           path: dist/LexPDF-x86_64.AppImage
 
-      - name: Release upload
-        if: github.event_name == 'release'
-        run: gh release upload ${{ github.ref_name }} dist/LexPDF-x86_64.AppImage --clobber
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Release con AppImage
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/LexPDF-x86_64.AppImage
 
   build-windows:
     runs-on: windows-latest
@@ -141,8 +141,8 @@ jobs:
           name: LexPDF-windows
           path: dist/lexpdf-setup.exe
 
-      - name: Release upload
-        if: github.event_name == 'release'
-        run: gh release upload ${{ github.ref_name }} dist/lexpdf-setup.exe --clobber
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Release con instalador
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/lexpdf-setup.exe
