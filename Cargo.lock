@@ -2828,6 +2828,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
+name = "lexpdf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "pdfium-render",
+ "rfd",
+ "serde",
+ "serde_json",
+ "slint",
+ "slint-build",
+ "ureq",
+ "zip",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3806,22 +3822,6 @@ dependencies = [
  "hmac",
  "password-hash",
  "sha2",
-]
-
-[[package]]
-name = "pdf-corrector"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "image",
- "pdfium-render",
- "rfd",
- "serde",
- "serde_json",
- "slint",
- "slint-build",
- "ureq",
- "zip",
 ]
 
 [[package]]

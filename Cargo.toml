@@ -14,7 +14,7 @@ pdfium-render = "0.8"
 image = "0.25"
 rfd = "0.15"
 anyhow = "1.0"
-ureq = "3" # ponytail: cliente HTTP sync sin runtime tokio; solo habla con el sidecar LT local
+ureq = { version = "3", default-features = false } # ponytail: sin TLS (solo http://localhost); sync por defecto
 serde = { version = "1", features = ["derive"] } # ponytail: solo para el historial JSON
 serde_json = "1" # ponytail: parsea /v2/check sin tipos extra
 

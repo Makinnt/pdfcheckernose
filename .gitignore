@@ -5,3 +5,5 @@
 /assets/lt.zip
 # PDFs con notas inyectadas (generados al anotar)
 *_anotado.pdf
+# staging de instaladores (pesado, se regenera en CI)
+/dist/

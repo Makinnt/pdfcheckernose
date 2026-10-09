@@ -417,6 +417,16 @@ fn push_errs(ui: &AppWindow, st: &Rc<RefCell<State>>) {
     st.borrow_mut().view = view;
     st.borrow_mut().view_group = view_group;
     ui.set_errors(ModelRc::new(VecModel::from_slice(&rows)));
+    if rows.is_empty() {
+        // ventana en blanco con causa: sin motor no hay nada que listar
+        let s = st.borrow();
+        if s.lt_dead {
+            ui.set_spell_status("Sin motor: instala Java 17+ o coloca lt/ junto al programa.".into());
+        } else if !s.scan_queue.is_empty() && s.scan_pos >= s.scan_queue.len() {
+            ui.set_spell_status("Sin errores.".into());
+        }
+        return;
+    }
     let graves = all.iter().filter(|e| e.sev == "grave").count();
     ui.set_spell_status(format!("{} errores ({} grave)", rows.len(), graves).into());
 }
