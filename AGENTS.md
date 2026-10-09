@@ -1,4 +1,4 @@
-# AGENTS.md — pdf-corrector
+# AGENTS.md — lexpdf
 
 Corrector ortográfico de escritorio, **100% offline** (sin red ni telemetría).
 Abre PDFs, extrae texto con coordenadas, revisa ortografía ES/EN en segundo plano,
@@ -26,7 +26,7 @@ index.html      # prototipo web anterior, solo referencia de diseño/UX
 
 ```bash
 cargo build                      # debug (~400MB por Slint, normal)
-cargo test --bin pdf-corrector   # 4 tests (coordenadas, subrayado, kinds, anotación real)
+cargo test --bin lexpdf   # 4 tests (coordenadas, subrayado, kinds, anotación real)
 cargo run -- /ruta/doc.pdf       # argv[1] abre directo, sin diálogo (útil para demos)
 PDF_DARK=1 cargo run -- doc.pdf  # arranca en tema oscuro
 PDFIUM_DYNAMIC_LIB_PATH=...      # alternativa a tener la lib junto al exe
@@ -117,7 +117,7 @@ ortografía, morado sintaxis), zoom ×1.25 (0.5–3.0) + nota libre con botón `
  con palabras clonadas —nunca Pdfium en hilos—, offsets en chars → box unión
  vía `join_words`/`span_to_box`; notas existentes leídas (`read_notes` →
  marcadores ámbar + sección Notas → salto centrado); historial 10 últimos en
- `~/.config/pdf-corrector/history.json` (errores/omitidos/notas + % revisado,
+ `~/.config/lexpdf/history.json` (errores/omitidos/notas + % revisado,
  sección Recientes → `open_doc`); `build.rs` descarga LT ~240MB a `assets/lt/`
  gitignoreado —requiere red en build y Java 17+ en runtime—; medido: arranque
 -`~4s, ~80ms/check, ~650MB RAM). `cargo test` rápido (sin motores pesados en tests).

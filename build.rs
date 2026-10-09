@@ -12,7 +12,7 @@ fn main() {
     if !lt_jar.is_file() {
         let zip = manifest.join("assets/lt.zip");
         if !zip.is_file() {
-            eprintln!("pdf-corrector: descargando LanguageTool (~240MB, solo primera vez)…");
+            eprintln!("lexpdf: descargando LanguageTool (~240MB, solo primera vez)…");
             let mut resp = ureq::get("https://languagetool.org/download/LanguageTool-stable.zip")
                 .call()
                 .expect("descarga de LanguageTool fallida (¿sin red?)");
@@ -20,7 +20,7 @@ fn main() {
             let mut reader = resp.into_body().into_reader();
             std::io::copy(&mut reader, &mut out).expect("escritura de assets/lt.zip");
         }
-        eprintln!("pdf-corrector: descomprimiendo LanguageTool…");
+        eprintln!("lexpdf: descomprimiendo LanguageTool…");
         unzip_lt(&zip, &manifest.join("assets"));
     }
 

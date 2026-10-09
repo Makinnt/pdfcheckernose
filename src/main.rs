@@ -660,12 +660,12 @@ struct HisEntry {
     mtime: i64,
 }
 
-/// `~/.config/pdf-corrector/history.json` (10 últimos).
+/// `~/.config/lexpdf/history.json` (10 últimos).
 fn history_file() -> Option<PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;
-    Some(PathBuf::from(home).join(".config/pdf-corrector/history.json"))
+    Some(PathBuf::from(home).join(".config/lexpdf/history.json"))
 }
 
 fn load_history() -> Vec<HisEntry> {

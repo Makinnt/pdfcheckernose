@@ -4,10 +4,10 @@
 
 ```powershell
 .\installer\windows\stage.ps1   # release + dist/windows (+ JRE Temurin)
-iscc installer\windows\pdf-corrector.iss
+iscc installer\windows\lexpdf.iss
 ```
 
-Sale `dist/pdf-corrector-setup.exe`. Instala en ruta corta (`C:\pdf-corrector`)
+Sale `dist/lexpdf-setup.exe`. Instala en ruta corta (`C:\lexpdf`)
 por los paths largos de LT.
 
 ## Java
@@ -19,10 +19,10 @@ descarga de Temurin 21 y deja continuar. La app busca java en:
 
 ## Firma gratis (SignPath, solo OSS)
 
-1. Cuenta en **signpath.io**, proyecto `pdf-corrector`, repo vinculado
+1. Cuenta en **signpath.io**, proyecto `lexpdf`, repo vinculado
    (el repo debe ser público).
 2. Secrets en GitHub: `SIGNPATH_API_TOKEN`, `SIGNPATH_ORG_ID`.
-3. Descomenta el paso en `.github/workflows/windows.yml` y ajusta slugs.
+3. Descomenta el paso en `.github/workflows/release.yml` y ajusta slugs.
 4. Sin firmar, SmartScreen avisará al principio (se atenúa con descargas).
 
 ## CI

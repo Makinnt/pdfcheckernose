@@ -1,4 +1,4 @@
-# pdf-corrector
+# LexPDF
 
 Revisor de PDF de escritorio, **100% offline**. Abre PDFs, revisa ortografía y sintaxis en español e inglés en segundo plano, subraya errores sobre la página y permite omitirlos o inyectar notas nativas en el PDF.
 
@@ -39,7 +39,7 @@ cargo run -- /ruta/doc.pdf
 # o sin argumento: elige el PDF en el diálogo
 
 PDF_DARK=1 cargo run -- doc.pdf
-cargo test --bin pdf-corrector
+cargo test --bin lexpdf
 cargo build   # debug ~400MB por Slint, normal
 ```
 

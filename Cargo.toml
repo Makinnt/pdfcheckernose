@@ -1,11 +1,11 @@
 [package]
-name = "pdf-corrector"
+name = "lexpdf"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
 [[bin]]
-name = "pdf-corrector"
+name = "lexpdf"
 path = "src/main.rs"
 
 [dependencies]
