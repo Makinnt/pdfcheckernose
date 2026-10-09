@@ -1093,14 +1093,31 @@ fn main() -> anyhow::Result<()> {
         let st = st.clone();
         ui.on_free_note_new(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let (pg, x, y) = {
-                let s = st.borrow();
-                (s.page, s.page_w / 2.0, s.page_h / 2.0)
-            };
-            st.borrow_mut().free_pt = Some((pg, x, y));
+            st.borrow_mut().free_pt = None; // armado: el toque en el doc fija el punto
             ui.set_free_note_text("".into());
             ui.set_free_note_on(true);
-            notify(&ui, &st, format!("Nota en pág {} (centro): escribe y pulsa Guardar", pg + 1));
+            notify(&ui, &st, "Toca el punto del documento para la nota".into());
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let st = st.clone();
+        ui.on_page_clicked(move |mx, my| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if !ui.get_free_note_on() {
+                return;
+            }
+            let s = st.borrow();
+            if s.img_w == 0 || s.img_h == 0 {
+                return;
+            }
+            // px de imagen 1:1 → puntos PDF (origen abajo-izq)
+            let x = (mx / s.img_w as f32 * s.page_w).clamp(0.0, s.page_w);
+            let y = (s.page_h - my / s.img_h as f32 * s.page_h).clamp(0.0, s.page_h);
+            let pg = s.page;
+            drop(s);
+            st.borrow_mut().free_pt = Some((pg, x, y));
+            notify(&ui, &st, "Punto marcado: escribe y pulsa Guardar".into());
         });
     }
     {

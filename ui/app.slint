@@ -134,6 +134,7 @@ export component AppWindow inherits Window {
     callback zoom-in();
     callback zoom-out();
     callback zoom-text(string);
+    callback page-clicked(float, float);
     callback free-note-new();
     callback free-note-save();
     callback free-note-cancel();
@@ -343,8 +344,10 @@ export component AppWindow inherits Window {
                                             height: 30px;
                                             background: root.c-pill; border-radius: 4px;
                                             TextInput {
+                                                x: 8px; width: parent.width - 16px; height: parent.height;
                                                 text <=> root.note-text;
                                                 font-size: 13px; color: root.c-fg;
+                                                vertical-alignment: center;
                                                 accepted => {
                                                     if (root.note-text != "") { root.save-note(root.selected-note); }
                                                 }
@@ -467,20 +470,27 @@ export component AppWindow inherits Window {
                             source <=> root.page-image;
                             width: 100%; height: 100%;
                         }
+                        // solo en modo nota: el toque marca el punto, no interfiere si no
+                        if (root.free-note-on): pg-touch := TouchArea {
+                            width: 100%; height: 100%;
+                            clicked => { root.page-clicked(pg-touch.mouse-x / 1px, pg-touch.mouse-y / 1px); }
+                        }
                     }
                 }
 
                 if (root.free-note-on): VerticalLayout {
                     spacing: 3px;
                     visible: root.has-doc;
-                    Text { text: "Nota libre en la página visible: escribe y guarda."; font-size: 12px; color: root.c-dim; wrap: word-wrap; }
+                    Text { text: "Toca el punto del documento, escribe y guarda."; font-size: 12px; color: root.c-dim; wrap: word-wrap; }
                     Rectangle {
                         height: 30px;
                         background: root.c-card; border-radius: 4px;
                         border-width: 1px; border-color: root.c-line;
                         TextInput {
+                            x: 8px; width: parent.width - 16px; height: parent.height;
                             text <=> root.free-note-text;
                             font-size: 13px; color: root.c-fg;
+                            vertical-alignment: center;
                             accepted => { if (root.free-note-text != "") { root.free-note-save(); } }
                         }
                     }
