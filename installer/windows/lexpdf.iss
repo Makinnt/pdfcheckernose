@@ -52,38 +52,43 @@ Filename: "{app}\lexpdf.exe"; Description: "Abrir {#MyAppName}"; Flags: nowait p
 const
   TemurinURL = 'https://adoptium.net/temurin/releases/?version=21&os=windows&arch=x64';
 
-function JavaDisponible(): Boolean;
+function JavaSistema(): Boolean;
 var
   Codigo: Integer;
-  Bundled: String;
 begin
-  { 1. JRE empaquetado junto al exe }
-  Bundled := ExpandConstant('{app}\jre\bin\java.exe');
-  if FileExists(Bundled) then
-  begin
-    Result := True;
-    Exit;
-  end;
-  { 2. Java del sistema }
+  { Solo Java del sistema: aquí {app} aún no existe, no usarlo. }
   Result := Exec('java.exe', '-version', '', SW_HIDE, ewWaitUntilTerminated, Codigo)
     and (Codigo = 0);
 end;
 
 function InitializeSetup(): Boolean;
-var
-  Respuesta, Codigo: Integer;
 begin
   Result := True;
-  if JavaDisponible() then
+  if JavaSistema() then
     Exit;
-  Respuesta := MsgBox(
+  { El instalador trae su propio JRE, esto es solo informativo. }
+  if MsgBox(
     'No se detectó Java en el sistema.' + #13#10 +
-    'La revisión de sintaxis lo necesita (Java 17 o superior).' + #13#10 + #13#10 +
-    '¿Abrir la página de descarga de Temurin ahora?' + #13#10 +
-    '(Puedes continuar e instalar Java después.)',
-    mbConfirmation, MB_YESNOCANCEL);
-  if Respuesta = IDYES then
-    ShellExec('open', TemurinURL, '', '', SW_SHOW, ewNoWait, Codigo);
-  if Respuesta = IDCANCEL then
+    'El instalador incluye su propio Java, no necesitas hacer nada.' + #13#10 + #13#10 +
+    '¿Continuar con la instalación?',
+    mbInformation, MB_OKCANCEL) = IDCANCEL then
     Result := False;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Bundled, Msg: String;
+  Codigo: Integer;
+begin
+  { Verificación post-instalación (aquí {app} ya existe). }
+  if CurStep <> ssPostInstall then
+    Exit;
+  Bundled := ExpandConstant('{app}\jre\bin\java.exe');
+  if FileExists(Bundled) or JavaSistema() then
+    Exit;
+  Msg := 'Aviso: no se encontró Java (ni incluido ni del sistema).' + #13#10 +
+    'La revisión no funcionará hasta instalar Java 17+.' + #13#10 + #13#10 +
+    '¿Abrir la página de descarga de Temurin ahora?';
+  if MsgBox(Msg, mbError, MB_YESNO) = IDYES then
+    ShellExec('open', TemurinURL, '', '', SW_SHOW, ewNoWait, Codigo);
 end;

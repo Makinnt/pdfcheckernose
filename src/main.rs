@@ -49,6 +49,7 @@ struct State {
     free_pt: Option<(u32, f32, f32)>, // nota libre pendiente: (página, x, y en puntos PDF)
     lt_ready: bool, // sidecar LanguageTool respondiendo en localhost:8081
     lt_dead: bool,  // LT no va a arrancar (sin java): el scan avanza sin sintaxis
+    syn_received: bool, // llegó al menos un Syn (si no, "LT no devolvió ninguno")
     lt_child: Option<std::process::Child>, // hijo java propio (None si se reutiliza uno externo)
     tx: Sender<SpellMsg>,
     last_lang: i32,
@@ -423,7 +424,11 @@ fn push_errs(ui: &AppWindow, st: &Rc<RefCell<State>>) {
         if s.lt_dead {
             ui.set_spell_status("Sin motor: instala Java 17+ o coloca lt/ junto al programa.".into());
         } else if !s.scan_queue.is_empty() && s.scan_pos >= s.scan_queue.len() {
-            ui.set_spell_status("Sin errores.".into());
+            if s.lt_ready && !s.syn_received {
+                ui.set_spell_status("Sin errores (LT no devolvió ninguno).".into());
+            } else {
+                ui.set_spell_status("Sin errores.".into());
+            }
         }
         return;
     }
@@ -962,6 +967,7 @@ fn main() -> anyhow::Result<()> {
         zoom: 0.5,
         free_pt: None,
         lt_ready: false,
+        syn_received: false,
         lt_dead: false,
         lt_child: None,
         tx,
@@ -984,16 +990,19 @@ fn main() -> anyhow::Result<()> {
                     SpellEvent::LtReady(child) => {
                         st.borrow_mut().lt_ready = true;
                         st.borrow_mut().lt_child = child;
+                        ui.set_lt_status("Motor: listo (local :8081).".into());
                         notify(&ui, &st, "Revisión lista (LanguageTool local).".into());
                     }
                     SpellEvent::LtFail(msg) => {
                         st.borrow_mut().lt_dead = true;
+                        ui.set_lt_status(format!("Motor: no disponible ({msg}).").into());
                         notify(&ui, &st, format!("Sin revisión: {msg}."));
                     }
                     SpellEvent::Syn(gen, hits) => {
                         if gen != st.borrow().scan_id {
                             continue;
                         }
+                        st.borrow_mut().syn_received = true;
                         let touched_cur = {
                             let mut s = st.borrow_mut();
                             let cur = s.page;
@@ -1542,6 +1551,15 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Fixture para anotar: /tmp se limpia solo; se restaura desde input/.
+    fn fixture_pdf() -> PathBuf {
+        let tmp = PathBuf::from("/tmp/doc3.pdf");
+        if !tmp.is_file() {
+            let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("input/El-viejo-y-el-mar.pdf");
+            std::fs::copy(&src, &tmp).expect("ni input/El-viejo-y-el-mar.pdf existe");
+        }
+        tmp
+    }
     #[test]
     fn pdf_to_image_flip_y() {
         // pág 100x200pts -> img 1000x2000px; box inferior-izq (10,20)-(30,40)
@@ -1630,15 +1648,14 @@ mod tests {
     }
     #[test]
     fn notes_roundtrip() {
-        let src = PathBuf::from("/tmp/doc3.pdf");
-        assert!(src.is_file(), "falta /tmp/doc3.pdf de prueba");
+        let src = fixture_pdf();
         let (tx, _rx) = channel::<SpellMsg>();
         let st = State {
             pdfium: load_pdfium(), path: Some(src.clone()), page: 0, total: 3,
             words: vec![], page_w: 0.0, page_h: 0.0, img_w: 0, img_h: 0,
             all_errs: vec![Misspelling { word: "herror".into(), sug: vec!["error".into()], page: 0, x0: 72.0, y0: 700.0, x1: 130.0, y1: 712.0, dismissed: false, kind: "Ortografía".into(), sev: "intermedia".into() }],
             doc_notes: vec![],
-            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 0.5, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, lt_child: None,
+            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 0.5, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, syn_received: false, lt_child: None,
         };
         annotate(&st, 0, "nota redonda").unwrap();
         let out = src.with_file_name("doc3_anotado.pdf");
@@ -1648,15 +1665,14 @@ mod tests {
     #[test]
     fn annotate_creates_sibling_file() {
         // ponytail: usa /tmp/doc3.pdf generado en dev; si falta, el test falla explícito
-        let src = PathBuf::from("/tmp/doc3.pdf");
-        assert!(src.is_file(), "falta /tmp/doc3.pdf de prueba");
+        let src = fixture_pdf();
         let (tx, _rx) = channel::<SpellMsg>();
         let st = State {
             pdfium: load_pdfium(), path: Some(src), page: 0, total: 3,
             words: vec![], page_w: 0.0, page_h: 0.0, img_w: 0, img_h: 0,
             all_errs: vec![Misspelling { word: "herror".into(), sug: vec!["error".into()], page: 0, x0: 72.0, y0: 700.0, x1: 130.0, y1: 712.0, dismissed: false, kind: "Ortografía".into(), sev: "intermedio".into() }],
             doc_notes: vec![],
-            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 1.0, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, lt_child: None,
+            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 1.0, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, syn_received: false, lt_child: None,
         };
         let out = annotate(&st, 0, "nota de prueba").unwrap();
         assert_eq!(out.file_name().unwrap(), "doc3_anotado.pdf");
