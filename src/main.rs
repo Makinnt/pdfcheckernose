@@ -741,10 +741,33 @@ fn history_file() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config/lexpdf/history.json"))
 }
 
+/// Una entrada manipulada no tumba el resto: valida campo por campo.
+/// Pura y testeable.
+fn sanitize_history(v: Vec<serde_json::Value>) -> Vec<HisEntry> {
+    let num = |e: &serde_json::Value, k: &str| e.get(k).and_then(|x| x.as_u64());
+    v.into_iter()
+        .filter_map(|e| {
+            let path = e.get("path").and_then(|x| x.as_str())?;
+            if path.is_empty() || path.len() > 1024 || path.contains('\0') {
+                return None;
+            }
+            Some(HisEntry {
+                path: path.to_string(),
+                pages: num(&e, "pages").filter(|&n| n > 0 && n < 100_000)? as u32,
+                errors: num(&e, "errors").filter(|&n| n < 1_000_000)? as usize,
+                resolved: num(&e, "resolved").filter(|&n| n < 1_000_000)? as usize,
+                notes: num(&e, "notes").filter(|&n| n < 1_000_000)? as usize,
+                mtime: e.get("mtime").and_then(|x| x.as_i64()).filter(|&t| t >= 0)?,
+            })
+        })
+        .collect()
+}
+
 fn load_history() -> Vec<HisEntry> {
     let Some(f) = history_file() else { return vec![] };
     let Ok(b) = std::fs::read_to_string(&f) else { return vec![] };
-    let mut v: Vec<HisEntry> = serde_json::from_str(&b).unwrap_or_default();
+    let raw: Vec<serde_json::Value> = serde_json::from_str(&b).unwrap_or_default();
+    let mut v = sanitize_history(raw);
     v.retain(|e| PathBuf::from(&e.path).is_file());
     v.truncate(10);
     v
@@ -756,7 +779,8 @@ fn touch_history(st: &State) {
     let Some(path) = st.path.clone() else { return };
     let mut v: Vec<HisEntry> = std::fs::read_to_string(&f)
         .ok()
-        .and_then(|b| serde_json::from_str(&b).ok())
+        .and_then(|b| serde_json::from_str::<Vec<serde_json::Value>>(&b).ok())
+        .map(sanitize_history)
         .unwrap_or_default();
     v.retain(|e| e.path != path.to_string_lossy());
     v.insert(0, HisEntry {
@@ -796,8 +820,30 @@ fn push_history(ui: &AppWindow) {
     ui.set_history(ModelRc::new(VecModel::from_slice(&rows)));
 }
 
+/// Solo PDFs: extensión + magia `%PDF-` (la extensión sola se falsifica
+/// renombrando; el filtro del diálogo no cubre argv ni historial).
+/// Puro y testeable.
+fn is_pdf(path: &PathBuf) -> bool {
+    let ext_ok = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    if !ext_ok {
+        return false;
+    }
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 5];
+    use std::io::Read;
+    f.read_exact(&mut magic).is_ok_and(|_| &magic == b"%PDF-")
+}
+
 /// Abre un documento por ruta (diálogo, argv o historial): misma tubería.
 fn open_doc(ui: &AppWindow, st: &Rc<RefCell<State>>, path: PathBuf) {
+    if !is_pdf(&path) {
+        ui.set_popup_text("Solo se admiten documentos PDF.".into());
+        st.borrow_mut().popup_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
+        return;
+    }
     let notes = read_notes(&st.borrow().pdfium, &path);
     st.borrow_mut().path = Some(path);
     st.borrow_mut().doc_notes = notes;
@@ -1672,8 +1718,36 @@ mod tests {
         assert_eq!(progress_state(10, 10, 0), (100, true));
     }
     #[test]
-    fn loopback_tripwire() {
-        assert!(is_loopback_url(&lt_url("/v2/check")));
+    fn only_pdfs_pass() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("lexpdf_t.pdf");
+        let fake = dir.join("lexpdf_t.pdf"); // se reescribe abajo
+        let exe = dir.join("lexpdf_t.exe");
+        std::fs::write(&good, b"%PDF-1.7 resto").unwrap();
+        assert!(is_pdf(&good));
+        std::fs::write(&fake, b"MZ\x90\x00disfrazado").unwrap();
+        assert!(!is_pdf(&fake)); // extensión pdf pero magia EXE
+        std::fs::write(&exe, b"%PDF-1.7 con ext mala").unwrap();
+        assert!(!is_pdf(&exe));
+        let upper = dir.join("lexpdf_t.PDF");
+        std::fs::write(&upper, b"%PDF-1.4").unwrap();
+        assert!(is_pdf(&upper));
+        for p in [&good, &fake, &exe, &upper] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+    #[test]
+    fn history_tamper_drops_one() {
+        let good = serde_json::json!({"path": "/tmp/a.pdf", "pages": 3, "errors": 1, "resolved": 0, "notes": 0, "mtime": 1});
+        let bad_type = serde_json::json!({"path": "/tmp/b.pdf", "pages": "tres", "errors": 1, "resolved": 0, "notes": 0, "mtime": 1});
+        let bad_range = serde_json::json!({"path": "/tmp/c.pdf", "pages": 0, "errors": 1, "resolved": 0, "notes": 0, "mtime": 1});
+        let bad_path = serde_json::json!({"path": "", "pages": 3, "errors": 1, "resolved": 0, "notes": 0, "mtime": 1});
+        let v = sanitize_history(vec![good, bad_type, bad_range, bad_path]);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "/tmp/a.pdf");
+    }
+    #[test]
+    fn loopback_tripwire() {        assert!(is_loopback_url(&lt_url("/v2/check")));
         assert!(is_loopback_url("http://127.0.0.1:8081/v2/check"));
         assert!(!is_loopback_url("http://192.168.1.1:8081/v2/check"));
         assert!(!is_loopback_url("http://localhost.evil.com/v2/check"));

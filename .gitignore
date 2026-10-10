@@ -7,3 +7,5 @@
 *_anotado.pdf
 # staging de instaladores (pesado, se regenera en CI)
 /dist/
+# secretos/entornos locales: jamás se commitean (van por env o GitHub Secrets)
+.env*
