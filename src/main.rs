@@ -49,6 +49,7 @@ struct State {
     free_pt: Option<(u32, f32, f32)>, // nota libre pendiente: (página, x, y en puntos PDF)
     lt_ready: bool, // sidecar LanguageTool respondiendo en localhost:8081
     lt_dead: bool,  // LT no va a arrancar (sin java): el scan avanza sin sintaxis
+    pending: u32, // hilos HTTP en vuelo (la barra sigue hasta que vuelven)
     syn_received: bool, // llegó al menos un Syn (si no, "LT no devolvió ninguno")
     lt_child: Option<std::process::Child>, // hijo java propio (None si se reutiliza uno externo)
     tx: Sender<SpellMsg>,
@@ -450,6 +451,7 @@ fn start_scan(ui: &AppWindow, st: &mut State) {
     st.view_group.clear();
     st.scan_queue = (st.page..total).chain(0..st.page).collect();
     st.scan_pos = 0;
+    st.pending = 0;
     st.last_lang = ui.get_lang_idx();
     ui.set_errors(ModelRc::new(VecModel::from_slice(&[])));
     ui.set_scanning(true);
@@ -465,7 +467,21 @@ fn start_scan(ui: &AppWindow, st: &mut State) {
 fn scan_tick(ui: &AppWindow, st: &Rc<RefCell<State>>) -> bool {
     {
         let s = st.borrow();
-        if s.scan_pos >= s.scan_queue.len() || (!s.lt_ready && !s.lt_dead) || s.path.is_none() {
+        if s.path.is_none() {
+            return false;
+        }
+        if !s.lt_ready && !s.lt_dead {
+            // motor arrancando (carga diccionarios, lento en Windows): barra visible
+            ui.set_scanning(true);
+            ui.set_scan_text("Cargando diccionarios…".into());
+            return false;
+        }
+        if s.scan_pos >= s.scan_queue.len() {
+            // cola vacía pero hilos en vuelo: sigue la barra con pendientes
+            if s.pending > 0 {
+                ui.set_scanning(true);
+                ui.set_scan_text(format!("Revisando… {} pág. pendientes", s.pending).into());
+            }
             return false;
         }
     }
@@ -493,12 +509,14 @@ fn scan_tick(ui: &AppWindow, st: &Rc<RefCell<State>>) -> bool {
         refresh_progress(ui, &s);
     }
     let launched = !jobs.is_empty();
+    if launched {
+        st.borrow_mut().pending += jobs.len() as u32;
+    }
     for (words, pg, mode, gen, tx) in jobs {
         std::thread::spawn(move || {
             let hits = syntax_page(&words, pg, mode);
-            if !hits.is_empty() {
-                let _ = tx.send(SpellEvent::Syn(gen, hits));
-            }
+            // siempre responde (aunque vacío) para cerrar el pendiente
+            let _ = tx.send(SpellEvent::Syn(gen, hits));
         });
     }
     if launched {
@@ -510,14 +528,21 @@ fn scan_tick(ui: &AppWindow, st: &Rc<RefCell<State>>) -> bool {
 /// Barra única: páginas extraídas de la cola (los hits LT llegan async).
 fn refresh_progress(ui: &AppWindow, s: &State) {
     let (len, done) = (s.scan_queue.len() as u32, s.scan_pos.min(s.scan_queue.len()) as u32);
-    let pct = if len == 0 { 100 } else { done * 100 / len };
+    let (pct, finished) = progress_state(len, done, s.pending);
     ui.set_scan_progress(pct as i32);
-    if len > 0 && done >= len {
+    if finished {
         ui.set_scanning(false);
         ui.set_scan_text("".into());
     } else {
         ui.set_scan_text(format!("{pct}% · pág. {done} de {len}…").into());
     }
+}
+
+/// (porcentaje, terminada): terminada solo con cola vacía Y sin hilos en vuelo.
+/// Pura para poder testearla sin UI.
+fn progress_state(len: u32, done: u32, pending: u32) -> (u32, bool) {
+    let pct = if len == 0 { 100 } else { done.min(len) * 100 / len };
+    (pct, len > 0 && done >= len && pending == 0)
 }
 
 /// Agrupa chars de Pdfium en palabras con su bounding box unión.
@@ -967,6 +992,7 @@ fn main() -> anyhow::Result<()> {
         zoom: 0.5,
         free_pt: None,
         lt_ready: false,
+        pending: 0,
         syn_received: false,
         lt_dead: false,
         lt_child: None,
@@ -1005,6 +1031,7 @@ fn main() -> anyhow::Result<()> {
                         st.borrow_mut().syn_received = true;
                         let touched_cur = {
                             let mut s = st.borrow_mut();
+                            s.pending = s.pending.saturating_sub(1);
                             let cur = s.page;
                             let t = hits.iter().any(|h| h.page == cur);
                             s.all_errs.extend(hits);
@@ -1014,6 +1041,12 @@ fn main() -> anyhow::Result<()> {
                         if touched_cur {
                             let pg = st.borrow().page;
                             show(&ui, &mut st.borrow_mut(), pg);
+                        }
+                        // cierra la barra solo cuando no queda nada en vuelo
+                        let s = st.borrow();
+                        if s.scan_pos >= s.scan_queue.len() && s.pending == 0 {
+                            ui.set_scanning(false);
+                            ui.set_scan_text("".into());
                         }
                     }
                 }
@@ -1218,17 +1251,20 @@ fn main() -> anyhow::Result<()> {
             {
                 let s = st.borrow();
                 if let Some(e) = s.all_errs.get(gi) {
+                    // sin tamaño de visor medido no se centra (evita saltos fuera de vista)
                     if s.img_w > 0 && s.img_h > 0 {
                         let (x, y, w, h) = pdf_to_image(e.x0, e.y0, e.x1, e.y1, s.page_w, s.page_h, s.img_w, s.img_h);
                         let (cx, cy) = (x + w / 2.0, y + h / 2.0);
                         let (vw, vh) = (ui.get_view_w(), ui.get_view_h());
-                        let oy = -((cy - vh / 2.0).clamp(0.0, (s.img_h as f32 - vh).max(0.0)));
-                        ui.set_view_y(oy);
-                        let ox_cur = ui.get_view_x();
-                        let vis0 = -ox_cur;
-                        if cx < vis0 || cx > vis0 + vw {
-                            let ox = -((cx - vw / 2.0).clamp(0.0, (s.img_w as f32 - vw).max(0.0)));
-                            ui.set_view_x(ox);
+                        if vw > 0.0 && vh > 0.0 {
+                            let oy = -((cy - vh / 2.0).clamp(0.0, (s.img_h as f32 - vh).max(0.0)));
+                            ui.set_view_y(oy);
+                            let ox_cur = ui.get_view_x();
+                            let vis0 = -ox_cur;
+                            if cx < vis0 || cx > vis0 + vw {
+                                let ox = -((cx - vw / 2.0).clamp(0.0, (s.img_w as f32 - vw).max(0.0)));
+                                ui.set_view_x(ox);
+                            }
                         }
                     }
                 }
@@ -1595,6 +1631,12 @@ mod tests {
         assert!(!boxes_overlap(&m(0, 0.0, 10.0), &m(1, 0.0, 10.0)));
     }
     #[test]
+    fn progress_waits_for_threads() {
+        assert_eq!(progress_state(10, 3, 0), (30, false));
+        assert_eq!(progress_state(10, 10, 2), (100, false)); // cola vacía, hilos en vuelo: sigue
+        assert_eq!(progress_state(10, 10, 0), (100, true));
+    }
+    #[test]
     fn span_mapping() {
         let ws = vec![
             Word { text: "She".into(), x0: 0.0, y0: 0.0, x1: 10.0, y1: 5.0 },
@@ -1655,7 +1697,8 @@ mod tests {
             words: vec![], page_w: 0.0, page_h: 0.0, img_w: 0, img_h: 0,
             all_errs: vec![Misspelling { word: "herror".into(), sug: vec!["error".into()], page: 0, x0: 72.0, y0: 700.0, x1: 130.0, y1: 712.0, dismissed: false, kind: "Ortografía".into(), sev: "intermedia".into() }],
             doc_notes: vec![],
-            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 0.5, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, syn_received: false, lt_child: None,
+            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 0.5, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, pending: 0,
+        syn_received: false, lt_child: None,
         };
         annotate(&st, 0, "nota redonda").unwrap();
         let out = src.with_file_name("doc3_anotado.pdf");
@@ -1672,7 +1715,8 @@ mod tests {
             words: vec![], page_w: 0.0, page_h: 0.0, img_w: 0, img_h: 0,
             all_errs: vec![Misspelling { word: "herror".into(), sug: vec!["error".into()], page: 0, x0: 72.0, y0: 700.0, x1: 130.0, y1: 712.0, dismissed: false, kind: "Ortografía".into(), sev: "intermedio".into() }],
             doc_notes: vec![],
-            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 1.0, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, syn_received: false, lt_child: None,
+            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 1.0, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, pending: 0,
+        syn_received: false, lt_child: None,
         };
         let out = annotate(&st, 0, "nota de prueba").unwrap();
         assert_eq!(out.file_name().unwrap(), "doc3_anotado.pdf");

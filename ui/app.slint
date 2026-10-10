@@ -465,6 +465,8 @@ export component AppWindow inherits Window {
                     content-height: root.img-h * 1px;
                     content-x <=> root.view-x;
                     content-y <=> root.view-y;
+                    // changed no dispara al inicio: sin init el centrado divide con 0
+                    init => { root.view-w = self.width; root.view-h = self.height; }
                     changed width => { root.view-w = self.width; }
                     changed height => { root.view-h = self.height; }
                     Rectangle {
