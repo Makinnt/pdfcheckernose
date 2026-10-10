@@ -50,8 +50,9 @@ struct State {
     lt_ready: bool, // sidecar LanguageTool respondiendo en localhost:8081
     lt_dead: bool,  // LT no va a arrancar (sin java): el scan avanza sin sintaxis
     pending: u32, // hilos HTTP en vuelo (la barra sigue hasta que vuelven)
+    sec_bytes: u64, // texto enviado al motor (métrica: siempre loopback)
     syn_received: bool, // llegó al menos un Syn (si no, "LT no devolvió ninguno")
-    lt_child: Option<std::process::Child>, // hijo java propio (None si se reutiliza uno externo)
+    lt_child: Option<std::process::Child>, // hijo java propio
     tx: Sender<SpellMsg>,
     last_lang: i32,
 }
@@ -127,7 +128,7 @@ fn desc_for(kind: &str, en: bool) -> &'static str {
 }
 
 enum SpellEvent {
-    LtReady(Option<std::process::Child>), // hijo java propio (None si se reutiliza externo)
+    LtReady(Option<std::process::Child>), // hijo java propio
     LtFail(String), // java ausente o LT no arranca: sin revisión hasta que haya servidor
     Syn(u64, Vec<Misspelling>), // (gen, hallazgos LT de una página: ortografía + sintaxis)
 }
@@ -181,6 +182,14 @@ fn lt_url(path: &str) -> String {
     format!("http://localhost:{LT_PORT}{path}")
 }
 
+/// Tripwire: el texto del PDF solo puede viajar a loopback. Puro y testeable.
+/// Ojo con `localhost.evil.com`: se compara el host exacto, no prefijo.
+fn is_loopback_url(url: &str) -> bool {
+    let after = url.strip_prefix("http://").unwrap_or("");
+    let host = after.split(['/', ':']).next().unwrap_or("");
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+}
+
 /// ¿Hay un servidor LT respondiendo? (sirve para reutilizar uno ya abierto).
 fn lt_alive() -> bool {
     ureq::get(&lt_url("/v2/languages"))
@@ -193,7 +202,12 @@ fn lt_alive() -> bool {
 
 /// Un chequeo /v2/check crudo: devuelve (offset_chars, len_chars, reemplazos<=3, categoría).
 fn lt_check(text: &str, lang: &str) -> Vec<(usize, usize, Vec<String>, String)> {
-    let body = match ureq::post(&lt_url("/v2/check"))
+    let url = lt_url("/v2/check");
+    if !is_loopback_url(&url) {
+        // Desvío del texto fuera de la máquina: corte abrupto ANTES de enviar nada.
+        std::process::abort();
+    }
+    let body = match ureq::post(&url)
         .config()
         .timeout_global(Some(std::time::Duration::from_secs(60)))
         .build()
@@ -435,6 +449,10 @@ fn push_errs(ui: &AppWindow, st: &Rc<RefCell<State>>) {
     }
     let graves = all.iter().filter(|e| e.sev == "grave").count();
     ui.set_spell_status(format!("{} errores ({} grave)", rows.len(), graves).into());
+    let s = st.borrow();
+    if s.lt_ready {
+        ui.set_lt_status(sec_line(s.sec_bytes / 1024).into());
+    }
 }
 
 /// Prepara el escaneo TODO el documento; el Timer lo avanza por trozos.
@@ -452,6 +470,7 @@ fn start_scan(ui: &AppWindow, st: &mut State) {
     st.scan_queue = (st.page..total).chain(0..st.page).collect();
     st.scan_pos = 0;
     st.pending = 0;
+    st.sec_bytes = 0;
     st.last_lang = ui.get_lang_idx();
     ui.set_errors(ModelRc::new(VecModel::from_slice(&[])));
     ui.set_scanning(true);
@@ -511,6 +530,7 @@ fn scan_tick(ui: &AppWindow, st: &Rc<RefCell<State>>) -> bool {
     let launched = !jobs.is_empty();
     if launched {
         st.borrow_mut().pending += jobs.len() as u32;
+        st.borrow_mut().sec_bytes += jobs.iter().map(|(w, _, _, _, _)| w.iter().map(|x| x.text.len() as u64).sum::<u64>()).sum::<u64>();
     }
     for (words, pg, mode, gen, tx) in jobs {
         std::thread::spawn(move || {
@@ -647,9 +667,22 @@ fn pdf_to_image(x0: f32, y0: f32, x1: f32, y1: f32, pw: f32, ph: f32, iw: u32, i
 /// (cuando base == destino): vía temporal + rename atómico.
 fn save_doc(doc: &PdfDocument, out: &PathBuf) -> anyhow::Result<()> {
     let tmp = out.with_extension("tmp.pdf");
-    doc.save_to_file(&tmp).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    std::fs::rename(&tmp, out)?;
-    Ok(())
+    let r: anyhow::Result<()> = (|| {
+        doc.save_to_file(&tmp).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        std::fs::rename(&tmp, out)?;
+        Ok(())
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp); // sin restos de la copia íntegra
+    }
+    r
+}
+
+/// Métrica visible: KB de texto revisado (siempre en loopback, ver tripwire).
+fn sec_line(kb: u64) -> String {
+    format!("Motor: listo (local :8081 · {kb} KB revisados sin salir del PC).")
 }
 
 /// Destino de anotaciones + base a abrir: si ya existe `{nombre}_anotado.pdf`
@@ -992,7 +1025,7 @@ fn main() -> anyhow::Result<()> {
         zoom: 0.5,
         free_pt: None,
         lt_ready: false,
-        pending: 0,
+        pending: 0, sec_bytes: 0,
         syn_received: false,
         lt_dead: false,
         lt_child: None,
@@ -1512,13 +1545,15 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // sidecar LanguageTool: reutiliza uno externo o levanta hijo java propio.
+    // sidecar LanguageTool: SOLO el hijo propio. Un :8081 ajeno recibiría el
+    // texto íntegro del PDF, así que ocupado = sin revisión (fail-closed).
     // ponytail: el Child viaja por el canal al hilo UI; los hilos de página solo hacen HTTP
     {
         let tx = st.borrow().tx.clone();
         std::thread::spawn(move || {
-            if lt_alive() {
-                let _ = tx.send(SpellEvent::LtReady(None));
+            // sonda de propiedad: si no podemos atar el puerto, alguien lo ocupa
+            if std::net::TcpListener::bind(("127.0.0.1", LT_PORT)).is_err() {
+                let _ = tx.send(SpellEvent::LtFail("puerto 8081 ocupado por un proceso ajeno: sin revisión (cierra el otro programa y reabre)".into()));
                 return;
             }
             let Some(dir) = lt_dir() else {
@@ -1637,6 +1672,15 @@ mod tests {
         assert_eq!(progress_state(10, 10, 0), (100, true));
     }
     #[test]
+    fn loopback_tripwire() {
+        assert!(is_loopback_url(&lt_url("/v2/check")));
+        assert!(is_loopback_url("http://127.0.0.1:8081/v2/check"));
+        assert!(!is_loopback_url("http://192.168.1.1:8081/v2/check"));
+        assert!(!is_loopback_url("http://localhost.evil.com/v2/check"));
+        assert!(!is_loopback_url("https://localhost:8081/v2/check"));
+        assert!(sec_line(12).contains("sin salir del PC"));
+    }
+    #[test]
     fn span_mapping() {
         let ws = vec![
             Word { text: "She".into(), x0: 0.0, y0: 0.0, x1: 10.0, y1: 5.0 },
@@ -1697,7 +1741,7 @@ mod tests {
             words: vec![], page_w: 0.0, page_h: 0.0, img_w: 0, img_h: 0,
             all_errs: vec![Misspelling { word: "herror".into(), sug: vec!["error".into()], page: 0, x0: 72.0, y0: 700.0, x1: 130.0, y1: 712.0, dismissed: false, kind: "Ortografía".into(), sev: "intermedia".into() }],
             doc_notes: vec![],
-            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 0.5, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, pending: 0,
+            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 0.5, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, pending: 0, sec_bytes: 0,
         syn_received: false, lt_child: None,
         };
         annotate(&st, 0, "nota redonda").unwrap();
@@ -1715,7 +1759,7 @@ mod tests {
             words: vec![], page_w: 0.0, page_h: 0.0, img_w: 0, img_h: 0,
             all_errs: vec![Misspelling { word: "herror".into(), sug: vec!["error".into()], page: 0, x0: 72.0, y0: 700.0, x1: 130.0, y1: 712.0, dismissed: false, kind: "Ortografía".into(), sev: "intermedio".into() }],
             doc_notes: vec![],
-            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 1.0, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, pending: 0,
+            scan_id: 0, scan_queue: vec![], scan_pos: 0, popup_until: None, zoom: 1.0, free_pt: None, tx, last_lang: 0, flash: None, view: vec![], view_group: vec![], expanded: HashSet::new(), lt_ready: true, lt_dead: false, pending: 0, sec_bytes: 0,
         syn_received: false, lt_child: None,
         };
         let out = annotate(&st, 0, "nota de prueba").unwrap();
